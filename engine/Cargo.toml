@@ -1,0 +1,13 @@
+[package]
+name = "engine"
+description = "no_std core for tiny-infer: model config, weight layout, arena allocator"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[lib]
+name = "engine"
+path = "src/lib.rs"
+
+[dependencies]
+libm = "0.2.16"

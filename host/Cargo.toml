@@ -1,0 +1,13 @@
+[package]
+name = "host"
+description = "std CLI host for tiny-infer: file loading, tokenizer, command line"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "tiny-infer"
+path = "src/main.rs"
+
+[dependencies]
+engine = { path = "../engine" }
