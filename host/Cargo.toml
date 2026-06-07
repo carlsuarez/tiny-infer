@@ -11,3 +11,4 @@ path = "src/main.rs"
 
 [dependencies]
 engine = { path = "../engine" }
+rand = "0.10.1"

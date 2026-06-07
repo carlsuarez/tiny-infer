@@ -5,8 +5,9 @@
 //!   print the parsed config, file-validation result, tokenizer metadata, and the
 //!   pre-computed memory budget.
 //! * **Generate** (`--prompt`): tokenize the prompt, run the forward pass per
-//!   position, greedily pick the next token, and stream the decoded text. Requires
-//!   a tokenizer. Temperature-0 (greedy) only in this milestone.
+//!   position, sample the next token (greedy at `--temperature 0`, otherwise from
+//!   the temperature-scaled softmax), and stream the decoded text. Requires a
+//!   tokenizer.
 
 mod error;
 mod loader;
@@ -16,9 +17,11 @@ use std::io::{self, Write};
 use std::process::ExitCode;
 use std::time::Instant;
 
-use engine::math::argmax;
+use engine::math::{argmax, maxf};
 use engine::memory::{arena_floats, MemoryBudget};
 use engine::{forward, Arena, Config, RunState, Weights};
+use rand::rngs::StdRng;
+use rand::{RngExt, SeedableRng};
 
 use crate::error::HostError;
 use crate::loader::Model;
@@ -39,7 +42,11 @@ OPTIONS:
     -t, --tokenizer <PATH>    Tokenizer path (alternative to positional)
     -p, --prompt <TEXT>       Prompt to continue (enables text generation)
     -n, --steps <N>           Max tokens to generate (default: model seq_len)
-        --temperature <F>     Sampling temperature; only 0 (greedy) is supported
+        --temperature <F>     Sampling temperature (default 0 = greedy/deterministic;
+                              higher = more random)
+        --topp <F>            Nucleus (top-p) sampling threshold in (0,1); sample only
+                              from the most-probable tokens summing to F (default: off)
+        --seed <N>            RNG seed for reproducible sampling (default: random)
     -h, --help                Print this help and exit
 
 With no --prompt, tiny-infer prints the model config, validates the files, and
@@ -79,14 +86,13 @@ fn run() -> Result<(), HostError> {
             HostError::Usage("generation (--prompt) requires a tokenizer (--tokenizer)".into())
         })?;
         let vocab = Vocab::load(&tok_path, model.config.vocab_size)?;
-        return generate(
-            &model.config,
-            &weights,
-            &vocab,
-            prompt,
-            args.steps,
+        let sampler = Sampler::new(
+            model.config.vocab_size,
             args.temperature,
+            args.topp,
+            args.seed,
         );
+        return generate(&model.config, &weights, &vocab, prompt, args.steps, sampler);
     }
 
     // Report mode.
@@ -102,28 +108,21 @@ fn run() -> Result<(), HostError> {
     Ok(())
 }
 
-/// Greedily generate text from `prompt` and stream it to stdout.
+/// Generate text from `prompt` and stream it to stdout.
 ///
 /// Tokenizes the prompt (with BOS), then for each position runs [`forward`] and
-/// takes the next token: still inside the prompt it replays the prompt tokens;
-/// afterwards it picks `argmax(logits)`. Stops at `steps` or when the model emits
-/// BOS (the sequence delimiter). A tokens/sec line is written to stderr.
+/// picks the next token with a [`Sampler`]: while still inside the prompt it
+/// replays the prompt tokens; afterwards it samples from the logits (greedy when
+/// `temperature == 0`). Stops at `steps` or when the model emits BOS (the sequence
+/// delimiter). A tokens/sec line is written to stderr.
 fn generate(
     config: &Config,
     weights: &Weights,
     vocab: &Vocab,
     prompt: &str,
     steps: Option<usize>,
-    temperature: f32,
+    mut sampler: Sampler,
 ) -> Result<(), HostError> {
-    if temperature != 0.0 {
-        return Err(HostError::Usage(
-            "only --temperature 0 (greedy) is supported in this milestone; \
-             sampling arrives in a later milestone"
-                .into(),
-        ));
-    }
-
     // `encode` always yields at least the BOS token, so `prompt_tokens[0]` is safe.
     let prompt_tokens = vocab.encode(prompt, true);
     let steps = steps.unwrap_or(config.seq_len).min(config.seq_len);
@@ -143,9 +142,9 @@ fn generate(
     while pos < steps {
         let logits = forward(config, weights, &mut state, token, pos);
         let next = if pos + 1 < prompt_tokens.len() {
-            prompt_tokens[pos + 1]
+            prompt_tokens[pos + 1] // still replaying the prompt
         } else {
-            argmax(logits)
+            sampler.sample(logits) // generate the next token
         };
         pos += 1;
         // BOS delimits sequences in llama2.c — stop if the model emits it.
@@ -167,6 +166,118 @@ fn generate(
         eprintln!("[{pos} tokens, {secs:.3}s, {tps:.1} tok/s]");
     }
     Ok(())
+}
+
+/// Turns a logits vector into the next token id.
+///
+/// Owns the RNG and a reusable scratch buffer so [`Sampler::sample`] allocates
+/// nothing per token. Three modes, decided by `temperature` / `topp`:
+/// * `temperature == 0` → deterministic greedy ([`argmax`]); this is the path the
+///   llama2.c parity test exercises.
+/// * `temperature > 0`, `topp` disabled (`<= 0` or `>= 1`) → draw from the full
+///   softmax(`logits / temperature`) distribution.
+/// * `temperature > 0`, `0 < topp < 1` → "nucleus" sampling: draw only from the
+///   smallest set of most-probable tokens whose cumulative probability reaches
+///   `topp`, trimming the unreliable long tail.
+struct Sampler {
+    temperature: f32,
+    topp: f32,
+    rng: StdRng,
+    /// `(probability, token id)` scratch for top-p, sized to the vocab up front and
+    /// reused every step so sorting the nucleus needs no per-token allocation.
+    probindex: Vec<(f32, usize)>,
+}
+
+impl Sampler {
+    fn new(vocab_size: usize, temperature: f32, topp: f32, seed: Option<u64>) -> Sampler {
+        // An explicit `--seed` makes sampling reproducible; otherwise seed from the
+        // OS. (The RNG is unused at temperature 0, which is greedy.)
+        let rng = match seed {
+            Some(s) => StdRng::seed_from_u64(s),
+            None => StdRng::from_rng(&mut rand::rng()),
+        };
+        Sampler {
+            temperature,
+            topp,
+            rng,
+            probindex: Vec::with_capacity(vocab_size),
+        }
+    }
+
+    fn sample(&mut self, logits: &[f32]) -> usize {
+        if self.temperature == 0.0 {
+            return argmax(logits);
+        }
+
+        // Unnormalized softmax weight of one logit (max-shifted for stability).
+        // Capture by value so the closure doesn't borrow `self` (the sampling
+        // helpers below need `&mut self`).
+        let (max, temperature) = (maxf(logits), self.temperature);
+        let weight = move |v: f32| f32::exp((v - max) / temperature);
+        let sum: f32 = logits.iter().copied().map(weight).sum();
+
+        if self.topp <= 0.0 || self.topp >= 1.0 {
+            return self.sample_full(logits, &weight, sum);
+        }
+        self.sample_topp(logits, &weight, sum)
+    }
+
+    /// Draw from the full distribution via inverse-transform sampling, comparing a
+    /// scaled uniform draw against the running unnormalized cumulative weight.
+    fn sample_full(&mut self, logits: &[f32], weight: &impl Fn(f32) -> f32, sum: f32) -> usize {
+        let target = self.rng.random::<f32>() * sum; // uniform in [0, sum)
+        let mut cdf = 0.0f32;
+        for (i, &v) in logits.iter().enumerate() {
+            cdf += weight(v);
+            if cdf > target {
+                return i;
+            }
+        }
+        logits.len() - 1 // only reached if f32 rounding leaves cdf just under target
+    }
+
+    /// Top-p (nucleus) sampling: keep the smallest set of highest-probability
+    /// tokens whose cumulative probability reaches `topp`, then sample within it.
+    fn sample_topp(&mut self, logits: &[f32], weight: &impl Fn(f32) -> f32, sum: f32) -> usize {
+        // Tokens below this probability cannot belong to the nucleus, so crop them
+        // before sorting. Holds whenever `topp >= 1/n`.
+        let cutoff = (1.0 - self.topp) / (logits.len() - 1) as f32;
+        self.probindex.clear();
+        for (i, &v) in logits.iter().enumerate() {
+            let p = weight(v) / sum;
+            if p >= cutoff {
+                self.probindex.push((p, i));
+            }
+        }
+        if self.probindex.is_empty() {
+            // `topp` smaller than 1/vocab cropped everything; fall back to greedy.
+            return argmax(logits);
+        }
+        // Highest probability first. `total_cmp` gives a total order (no NaN unwrap).
+        self.probindex.sort_unstable_by(|a, b| b.0.total_cmp(&a.0));
+
+        // Truncate where the cumulative probability first exceeds `topp`.
+        let mut cumulative = 0.0f32;
+        let mut last = self.probindex.len() - 1;
+        for (i, &(p, _)) in self.probindex.iter().enumerate() {
+            cumulative += p;
+            if cumulative > self.topp {
+                last = i;
+                break;
+            }
+        }
+
+        // Sample within the nucleus, renormalized by its cumulative mass.
+        let target = self.rng.random::<f32>() * cumulative;
+        let mut cdf = 0.0f32;
+        for &(p, idx) in &self.probindex[..=last] {
+            cdf += p;
+            if cdf > target {
+                return idx;
+            }
+        }
+        self.probindex[last].1 // f32 rounding fallback
+    }
 }
 
 fn report_model(path: &str, model: &Model) {
@@ -236,10 +347,7 @@ fn report_memory(model: &Model) {
         human_bytes(budget.total_bytes()),
         commas(budget.total_floats())
     );
-    println!(
-        "  weights (disk) {:>10}",
-        human_bytes(model.weight_bytes())
-    );
+    println!("  weights (disk) {:>10}", human_bytes(model.weight_bytes()));
     println!(
         "  peak RAM       {:>10}  (weights + arena)",
         human_bytes(model.weight_bytes() + budget.total_bytes())
@@ -283,6 +391,8 @@ struct Args {
     prompt: Option<String>,
     steps: Option<usize>,
     temperature: f32,
+    topp: f32,
+    seed: Option<u64>,
     help: bool,
 }
 
@@ -293,6 +403,8 @@ impl Args {
         let mut prompt = None;
         let mut steps = None;
         let mut temperature = 0.0;
+        let mut topp = 0.0;
+        let mut seed = None;
         let mut help = false;
         let mut positionals = Vec::new();
 
@@ -307,13 +419,19 @@ impl Args {
                 "--temperature" => {
                     temperature = parse_f32(&expect_value(&mut it, &arg)?, &arg)?;
                 }
+                "--topp" => topp = parse_f32(&expect_value(&mut it, &arg)?, &arg)?,
+                "--seed" => seed = Some(parse_u64(&expect_value(&mut it, &arg)?, &arg)?),
                 s if s.starts_with("--model=") => model = Some(after_eq(s)),
                 s if s.starts_with("--tokenizer=") => tokenizer = Some(after_eq(s)),
                 s if s.starts_with("--prompt=") => prompt = Some(after_eq(s)),
-                s if s.starts_with("--steps=") => steps = Some(parse_usize(&after_eq(s), "--steps")?),
+                s if s.starts_with("--steps=") => {
+                    steps = Some(parse_usize(&after_eq(s), "--steps")?)
+                }
                 s if s.starts_with("--temperature=") => {
                     temperature = parse_f32(&after_eq(s), "--temperature")?;
                 }
+                s if s.starts_with("--topp=") => topp = parse_f32(&after_eq(s), "--topp")?,
+                s if s.starts_with("--seed=") => seed = Some(parse_u64(&after_eq(s), "--seed")?),
                 s if s.starts_with('-') && s != "-" => {
                     return Err(HostError::Usage(format!("unknown option `{s}`")));
                 }
@@ -339,6 +457,8 @@ impl Args {
             prompt,
             steps,
             temperature,
+            topp,
+            seed,
             help,
         })
     }
@@ -357,8 +477,19 @@ fn after_eq(s: &str) -> String {
 }
 
 fn parse_usize(s: &str, flag: &str) -> Result<usize, HostError> {
-    s.parse::<usize>()
-        .map_err(|_| HostError::Usage(format!("`{flag}` expects a non-negative integer, got `{s}`")))
+    s.parse::<usize>().map_err(|_| {
+        HostError::Usage(format!(
+            "`{flag}` expects a non-negative integer, got `{s}`"
+        ))
+    })
+}
+
+fn parse_u64(s: &str, flag: &str) -> Result<u64, HostError> {
+    s.parse::<u64>().map_err(|_| {
+        HostError::Usage(format!(
+            "`{flag}` expects a non-negative integer, got `{s}`"
+        ))
+    })
 }
 
 fn parse_f32(s: &str, flag: &str) -> Result<f32, HostError> {
@@ -417,19 +548,67 @@ mod tests {
         assert_eq!(a.prompt.as_deref(), Some("Once upon a time"));
         assert_eq!(a.steps, Some(64));
         assert_eq!(a.temperature, 0.0);
+        assert_eq!(a.seed, None);
 
-        let b = parse(&["m.bin", "--prompt=hi", "--temperature=0"]).unwrap();
+        let b = parse(&[
+            "m.bin",
+            "--prompt=hi",
+            "--temperature=0.9",
+            "--topp=0.8",
+            "--seed=42",
+        ])
+        .unwrap();
         assert_eq!(b.prompt.as_deref(), Some("hi"));
-        assert_eq!(b.temperature, 0.0);
+        assert_eq!(b.temperature, 0.9);
+        assert_eq!(b.topp, 0.8);
+        assert_eq!(b.seed, Some(42));
     }
 
     #[test]
     fn bad_steps_value_is_usage_error() {
-        assert!(matches!(parse(&["m.bin", "-n", "lots"]), Err(HostError::Usage(_))));
+        assert!(matches!(
+            parse(&["m.bin", "-n", "lots"]),
+            Err(HostError::Usage(_))
+        ));
         assert!(matches!(
             parse(&["m.bin", "--temperature=warm"]),
             Err(HostError::Usage(_))
         ));
+        assert!(matches!(
+            parse(&["m.bin", "--seed=soon"]),
+            Err(HostError::Usage(_))
+        ));
+        assert!(matches!(
+            parse(&["m.bin", "--topp=most"]),
+            Err(HostError::Usage(_))
+        ));
+    }
+
+    #[test]
+    fn sampler_temperature_zero_is_greedy() {
+        let mut s = Sampler::new(4, 0.0, 0.0, Some(1));
+        assert_eq!(s.sample(&[0.1, 9.0, 0.2, 0.3]), 1);
+    }
+
+    #[test]
+    fn sampler_tiny_topp_collapses_to_top_token() {
+        // A near-zero topp shrinks the nucleus to the single most-probable token,
+        // so the draw is deterministic regardless of temperature or seed.
+        let logits = [1.0f32, 5.0, 2.0, 0.5];
+        let mut s = Sampler::new(4, 1.0, 1e-6, Some(123));
+        for _ in 0..8 {
+            assert_eq!(s.sample(&logits), 1);
+        }
+    }
+
+    #[test]
+    fn sampler_is_reproducible_with_a_seed() {
+        let logits = [1.0f32, 2.0, 0.5, 1.5, 3.0];
+        let draws = |seed| {
+            let mut s = Sampler::new(5, 1.0, 0.9, Some(seed));
+            (0..16).map(|_| s.sample(&logits)).collect::<Vec<_>>()
+        };
+        assert_eq!(draws(7), draws(7));
     }
 
     #[test]

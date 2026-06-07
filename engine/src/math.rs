@@ -59,8 +59,9 @@ pub fn rmsnorm(out: &mut [f32], x: &[f32], w: &[f32]) {
 /// In-place numerically-stable softmax over `x`.
 ///
 /// Subtracts the max before exponentiating (so the largest term is `e^0 = 1` and
-/// nothing overflows), then normalizes to sum to 1. Used both for the attention
-/// weights and, in later milestones, the sampling distribution.
+/// nothing overflows), then normalizes to sum to 1. Used for the attention
+/// weights. (The host's temperature sampler applies the same max-shift trick over
+/// the logits, but inline, since it only borrows them immutably.)
 pub fn softmax(x: &mut [f32]) {
     let max_val = maxf(x);
 

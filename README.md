@@ -23,8 +23,14 @@ encode/decode. The CLI now generates text. Greedy (temperature-0) output is
 **byte-for-byte identical to llama2.c `run.c`** on stories15M — the correctness
 gate (see [Parity](#parity-with-llama2c)).
 
-Upcoming: temperature / top-p sampling + a streaming CLI, then `no_std` hardening
-polish, then optional int8 / SIMD.
+**Milestone 3 — sampling (in progress).** Generation now supports temperature and
+top-p (nucleus) sampling in addition to greedy decode: `--temperature 0` (the
+default) stays deterministic/greedy, a higher temperature draws each token from the
+softmax distribution, and `--topp <F>` restricts that draw to the most-probable
+tokens whose probabilities sum to `F`. `--seed` makes a sampled run reproducible.
+
+Upcoming: streaming-CLI polish, then `no_std` hardening polish, then optional
+int8 / SIMD.
 
 ## Workspace layout
 
@@ -56,7 +62,7 @@ curl -L -o models/tokenizer.bin \
 cargo build --release
 ```
 
-**Generate text** (greedy / temperature 0):
+**Generate text:**
 
 ```sh
 cargo run --release -p host -- \
@@ -71,8 +77,19 @@ in the sunshine. ...
 ```
 
 `--steps` defaults to the model's `seq_len`; generation stops early at the BOS
-delimiter. Only `--temperature 0` (greedy) is supported so far; sampling arrives
-in the next milestone.
+delimiter. `--temperature 0` (the default) is greedy and deterministic; a higher
+temperature samples from the softmax distribution for more varied output, and
+`--topp` adds nucleus sampling on top (sampling only from the most-probable tokens
+whose probabilities sum to the given threshold, which trims the unreliable tail):
+
+```sh
+cargo run --release -p host -- \
+  models/stories15M.bin models/tokenizer.bin \
+  --prompt "Once upon a time" --temperature 1.0 --topp 0.9 --seed 42
+```
+
+Pass `--seed <N>` to make a sampled run reproducible (omit it for fresh
+randomness each run).
 
 **Inspect a checkpoint** (no `--prompt` → report mode):
 
