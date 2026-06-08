@@ -11,6 +11,8 @@
 //!
 //! [`Arena`]: crate::Arena
 
+use crate::quantize::QuantizedTensor;
+
 /// Matrix–vector product `out = W · x` for a row-major weight matrix.
 ///
 /// `w` is laid out as `[d_out, d_in]` (row `i` is `w[i*d_in .. (i+1)*d_in]`), so
@@ -24,12 +26,47 @@ pub fn matmul(out: &mut [f32], x: &[f32], w: &[f32], d_in: usize, d_out: usize) 
     debug_assert_eq!(x.len(), d_in);
     debug_assert_eq!(w.len(), d_in * d_out);
 
-    for i in 0..d_out {
+    for (i, o) in out.iter_mut().enumerate() {
         let mut sum = 0.0f32;
-        for j in 0..d_in {
-            sum += w[i * d_in + j] * x[j];
+        for (j, &xj) in x.iter().enumerate() {
+            sum += w[i * d_in + j] * xj;
         }
-        out[i] = sum;
+        *o = sum;
+    }
+}
+
+/// Matrix–vector product `out = W · x` for a **group-wise int8-quantized** `W`.
+///
+/// The integer counterpart of [`matmul`]: `qw` stores `W` as 8-bit values plus one
+/// `f32` scale per [`group_size`](QuantizedTensor::group_size) consecutive weights,
+/// so weight `w[i*d_in + j]` dequantizes to `qw.data[i*d_in + j] as f32 * scale`,
+/// where `scale = qw.scales[i*groups_per_row + j/group_size]` is the scale covering
+/// column `j` of row `i`. The dequantize multiply happens inline in the dot product;
+/// the activation `x` stays full-precision `f32`.
+///
+/// `qw` must be a **single** projection's matrix shaped `[d_out, d_in]` — slice a
+/// per-layer view with [`QuantizedTensor::layer`] before calling, exactly as the
+/// fp32 path slices `w.wq[l*rows*cols..]`. `group_size` must divide `d_in` so groups
+/// never straddle a row boundary.
+///
+/// # Panics
+pub fn matmul_q8(out: &mut [f32], x: &[f32], qw: &QuantizedTensor, d_in: usize, d_out: usize) {
+    debug_assert_eq!(out.len(), d_out);
+    debug_assert_eq!(x.len(), d_in);
+    debug_assert_eq!(qw.data.len(), d_in * d_out);
+    debug_assert_eq!(d_in % qw.group_size, 0);
+    debug_assert_eq!(qw.scales.len(), d_out * (d_in / qw.group_size));
+
+    let groups_per_row = d_in / qw.group_size;
+    for (i, o) in out.iter_mut().enumerate() {
+        let mut sum = 0.0f32;
+        for (j, &xj) in x.iter().enumerate() {
+            let group = j / qw.group_size;
+            let scale = qw.scales[i * groups_per_row + group];
+            let w = qw.data[i * d_in + j] as f32 * scale;
+            sum += w * xj;
+        }
+        *o = sum;
     }
 }
 
@@ -252,7 +289,7 @@ mod tests {
     #[test]
     fn silu_known_values() {
         assert!(close(silu(0.0), 0.0)); // 0 * sigmoid(0)
-        // silu(1) = 1 / (1 + e^-1) ≈ 0.7310586
+                                        // silu(1) = 1 / (1 + e^-1) ≈ 0.7310586
         assert!(close(silu(1.0), 0.731_058_6));
         // Large positive ~ identity, large negative ~ 0.
         assert!(silu(20.0) > 19.99);

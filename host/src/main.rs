@@ -19,7 +19,8 @@ use std::time::Instant;
 
 use engine::math::{argmax, maxf};
 use engine::memory::{arena_floats, MemoryBudget};
-use engine::{forward, Arena, Config, RunState, Weights};
+use engine::quantize::{quantize_weights, quantized_scale_count, quantized_weight_count};
+use engine::{forward, Arena, Config, ModelWeights, RunState};
 use rand::rngs::StdRng;
 use rand::{RngExt, SeedableRng};
 
@@ -47,6 +48,11 @@ OPTIONS:
         --topp <F>            Nucleus (top-p) sampling threshold in (0,1); sample only
                               from the most-probable tokens summing to F (default: off)
         --seed <N>            RNG seed for reproducible sampling (default: random)
+    -q, --quantize            Quantize matmul weights to int8 (group-wise) before
+                              generating — smaller weight footprint, slightly lossy
+                              (scalar int8 is not faster than fp32; the win is memory)
+        --group-size <N>      Int8 quantization group size; must divide the model's
+                              dim, hidden_dim, and kv_dim (default: 32)
     -h, --help                Print this help and exit
 
 With no --prompt, tiny-infer prints the model config, validates the files, and
@@ -77,25 +83,61 @@ fn run() -> Result<(), HostError> {
         .ok_or_else(|| HostError::Usage("no model file given".into()))?;
 
     let model = Model::load(&model_path)?;
-    // Validate the weight layout (proves every tensor view fits the file).
-    let weights = model.weights()?;
+    let config = model.config; // Copy, so generation can outlive the file buffer.
 
     // Generation mode: requires a prompt and a tokenizer.
     if let Some(prompt) = args.prompt.as_deref() {
         let tok_path = args.tokenizer.ok_or_else(|| {
             HostError::Usage("generation (--prompt) requires a tokenizer (--tokenizer)".into())
         })?;
-        let vocab = Vocab::load(&tok_path, model.config.vocab_size)?;
-        let sampler = Sampler::new(
-            model.config.vocab_size,
-            args.temperature,
-            args.topp,
-            args.seed,
+        let vocab = Vocab::load(&tok_path, config.vocab_size)?;
+        let sampler = Sampler::new(config.vocab_size, args.temperature, args.topp, args.seed);
+
+        if args.quantize {
+            let gs = args.group_size;
+            check_group_size(&config, gs)?;
+            // Quantize from the fp32 file and copy out the tiny fp32 RMSNorm gains,
+            // then drop the file so only the int8 weights stay resident while we
+            // generate. (`QuantizedWeights` borrows none of the original file.)
+            let mut data = vec![0i8; quantized_weight_count(&config)];
+            let mut scales = vec![0.0f32; quantized_scale_count(&config, gs)];
+            let (rms_att, rms_ffn, rms_final);
+            {
+                let weights = model.weights()?;
+                quantize_weights(&weights, &mut data, &mut scales, gs, &config);
+                rms_att = weights.rms_att.to_vec();
+                rms_ffn = weights.rms_ffn.to_vec();
+                rms_final = weights.rms_final.to_vec();
+            }
+            report_quantization(&data, &scales, model.weight_bytes(), gs);
+            drop(model); // free the fp32 checkpoint (the bulk of the memory)
+            let qw = engine::QuantizedWeights::new(
+                &data, &scales, &rms_att, &rms_ffn, &rms_final, gs, &config,
+            )
+            .map_err(|e| HostError::engine(&model_path, e))?;
+            return generate(
+                &config,
+                &ModelWeights::Q8(qw),
+                &vocab,
+                prompt,
+                args.steps,
+                sampler,
+            );
+        }
+
+        let weights = model.weights()?;
+        return generate(
+            &config,
+            &ModelWeights::F32(weights),
+            &vocab,
+            prompt,
+            args.steps,
+            sampler,
         );
-        return generate(&model.config, &weights, &vocab, prompt, args.steps, sampler);
     }
 
-    // Report mode.
+    // Report mode: validate the weight layout, then print the model summary.
+    let _ = model.weights()?;
     report_model(&model_path, &model);
     if let Some(tok_path) = args.tokenizer {
         let vocab = Vocab::load(&tok_path, model.config.vocab_size)?;
@@ -117,7 +159,7 @@ fn run() -> Result<(), HostError> {
 /// delimiter). A tokens/sec line is written to stderr.
 fn generate(
     config: &Config,
-    weights: &Weights,
+    weights: &ModelWeights,
     vocab: &Vocab,
     prompt: &str,
     steps: Option<usize>,
@@ -354,6 +396,42 @@ fn report_memory(model: &Model) {
     );
 }
 
+/// Reject a quantization group size that does not evenly divide the weight
+/// dimensions. Quantization groups never straddle a row, so the group size must
+/// divide every matmul's input dimension; otherwise the int8 tensors would be
+/// silently truncated/corrupted.
+fn check_group_size(c: &Config, gs: usize) -> Result<(), HostError> {
+    if gs == 0 {
+        return Err(HostError::Usage("--group-size must be at least 1".into()));
+    }
+    for (name, d) in [
+        ("dim", c.dim),
+        ("hidden_dim", c.hidden_dim),
+        ("kv_dim", c.kv_dim()),
+    ] {
+        if !d.is_multiple_of(gs) {
+            return Err(HostError::Usage(format!(
+                "--group-size {gs} must divide {name} ({d})"
+            )));
+        }
+    }
+    Ok(())
+}
+
+/// Note the int8 quantization on stderr: the resident int8 weight size (data +
+/// scales, embedding included) against the fp32 checkpoint we freed afterward.
+fn report_quantization(data: &[i8], scales: &[f32], fp32_weight_bytes: usize, gs: usize) {
+    let int8_bytes = data.len() + scales.len() * 4;
+    eprintln!(
+        "[quantized to int8 (group_size {gs}): {} weights resident \
+         ({} int8 + {} scales); freed the {} fp32 checkpoint]",
+        human_bytes(int8_bytes),
+        human_bytes(data.len()),
+        human_bytes(scales.len() * 4),
+        human_bytes(fp32_weight_bytes),
+    );
+}
+
 /// Render a byte count as a human-friendly KiB/MiB/GiB string.
 fn human_bytes(n: usize) -> String {
     const UNITS: [&str; 4] = ["B", "KiB", "MiB", "GiB"];
@@ -393,6 +471,8 @@ struct Args {
     temperature: f32,
     topp: f32,
     seed: Option<u64>,
+    quantize: bool,
+    group_size: usize,
     help: bool,
 }
 
@@ -405,6 +485,8 @@ impl Args {
         let mut temperature = 0.0;
         let mut topp = 0.0;
         let mut seed = None;
+        let mut quantize = false;
+        let mut group_size = 32usize;
         let mut help = false;
         let mut positionals = Vec::new();
 
@@ -421,6 +503,10 @@ impl Args {
                 }
                 "--topp" => topp = parse_f32(&expect_value(&mut it, &arg)?, &arg)?,
                 "--seed" => seed = Some(parse_u64(&expect_value(&mut it, &arg)?, &arg)?),
+                "-q" | "--quantize" => quantize = true,
+                "--group-size" => {
+                    group_size = parse_usize(&expect_value(&mut it, &arg)?, &arg)?
+                }
                 s if s.starts_with("--model=") => model = Some(after_eq(s)),
                 s if s.starts_with("--tokenizer=") => tokenizer = Some(after_eq(s)),
                 s if s.starts_with("--prompt=") => prompt = Some(after_eq(s)),
@@ -432,6 +518,9 @@ impl Args {
                 }
                 s if s.starts_with("--topp=") => topp = parse_f32(&after_eq(s), "--topp")?,
                 s if s.starts_with("--seed=") => seed = Some(parse_u64(&after_eq(s), "--seed")?),
+                s if s.starts_with("--group-size=") => {
+                    group_size = parse_usize(&after_eq(s), "--group-size")?
+                }
                 s if s.starts_with('-') && s != "-" => {
                     return Err(HostError::Usage(format!("unknown option `{s}`")));
                 }
@@ -459,6 +548,8 @@ impl Args {
             temperature,
             topp,
             seed,
+            quantize,
+            group_size,
             help,
         })
     }
@@ -562,6 +653,46 @@ mod tests {
         assert_eq!(b.temperature, 0.9);
         assert_eq!(b.topp, 0.8);
         assert_eq!(b.seed, Some(42));
+    }
+
+    #[test]
+    fn quantization_flags_parse() {
+        // Off by default, with a group size that divides the stories15M dims.
+        let def = parse(&["m.bin"]).unwrap();
+        assert!(!def.quantize);
+        assert_eq!(def.group_size, 32);
+
+        let a = parse(&["m.bin", "-q", "--group-size", "64"]).unwrap();
+        assert!(a.quantize);
+        assert_eq!(a.group_size, 64);
+
+        let b = parse(&["m.bin", "--quantize", "--group-size=96"]).unwrap();
+        assert!(b.quantize);
+        assert_eq!(b.group_size, 96);
+    }
+
+    fn stories_like_config() -> Config {
+        Config {
+            dim: 288,
+            hidden_dim: 768,
+            n_layers: 6,
+            n_heads: 6,
+            n_kv_heads: 6,
+            vocab_size: 32000,
+            seq_len: 256,
+            shared_weights: true,
+        }
+    }
+
+    #[test]
+    fn check_group_size_accepts_divisors_rejects_others() {
+        let c = stories_like_config();
+        // 32 and 96 divide dim (288), hidden_dim (768), and kv_dim (288).
+        assert!(check_group_size(&c, 32).is_ok());
+        assert!(check_group_size(&c, 96).is_ok());
+        // 64 divides 768 but not 288.
+        assert!(matches!(check_group_size(&c, 64), Err(HostError::Usage(_))));
+        assert!(matches!(check_group_size(&c, 0), Err(HostError::Usage(_))));
     }
 
     #[test]

@@ -26,12 +26,14 @@ pub mod error;
 pub mod math;
 pub mod memory;
 pub mod model;
+pub mod quantize;
 pub mod state;
 pub mod weights;
 
 pub use arena::Arena;
 pub use config::Config;
 pub use error::EngineError;
-pub use model::forward;
+pub use model::{forward, ModelWeights};
+pub use quantize::{QuantizedTensor, QuantizedWeights};
 pub use state::RunState;
 pub use weights::Weights;

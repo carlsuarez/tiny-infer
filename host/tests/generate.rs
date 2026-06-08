@@ -174,3 +174,56 @@ fn topp_generation_is_reproducible_under_a_fixed_seed() {
     assert!(a.trim().len() > "Once upon a time".len(), "no text generated");
     assert_eq!(a, run(), "same seed must reproduce the same top-p output");
 }
+
+#[test]
+fn quantized_greedy_generation_produces_coherent_text() {
+    let (Some(model), Some(tok)) = (fixture("stories15M.bin"), fixture("tokenizer.bin")) else {
+        eprintln!("skipping: fixtures not present");
+        return;
+    };
+
+    let out = Command::new(BIN)
+        .arg(&model)
+        .arg(&tok)
+        .args(["-p", "Once upon a time", "-n", "40", "--quantize"])
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "exit {:?}\nstderr: {}",
+        out.status.code(),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let text = String::from_utf8(out.stdout).expect("output is valid UTF-8");
+    // Int8 (group_size 32) greedy decode is deterministic and, on stories15M, tracks
+    // the fp32 stream closely enough to keep the opening of the golden story.
+    assert!(
+        text.starts_with("Once upon a time, there was a little girl named Lily."),
+        "quantized output drifted: {text:?}"
+    );
+    // The quantization note (including freeing the fp32 checkpoint) goes to stderr.
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("quantized to int8") && stderr.contains("freed"),
+        "stderr:\n{stderr}"
+    );
+}
+
+#[test]
+fn invalid_group_size_is_a_usage_error() {
+    let (Some(model), Some(tok)) = (fixture("stories15M.bin"), fixture("tokenizer.bin")) else {
+        eprintln!("skipping: fixtures not present");
+        return;
+    };
+
+    // 64 divides hidden_dim (768) but not dim (288), so it must be rejected cleanly.
+    let out = Command::new(BIN)
+        .arg(&model)
+        .arg(&tok)
+        .args(["-p", "hi", "-n", "8", "--quantize", "--group-size", "64"])
+        .output()
+        .unwrap();
+    assert_eq!(out.status.code(), Some(2));
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(stderr.contains("group-size"), "stderr:\n{stderr}");
+}
