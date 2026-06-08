@@ -29,8 +29,22 @@ default) stays deterministic/greedy, a higher temperature draws each token from 
 softmax distribution, and `--topp <F>` restricts that draw to the most-probable
 tokens whose probabilities sum to `F`. `--seed` makes a sampled run reproducible.
 
-Upcoming: streaming-CLI polish, then `no_std` hardening polish, then optional
-int8 / SIMD.
+**Int8 quantization (`--quantize`).** All the matmul weights — the seven layer
+projections and the token-embedding/classifier table — can be quantized to group-wise
+symmetric int8; only the (tiny) RMSNorm gains stay fp32. A single `forward` runs over
+either representation via an `engine::ModelWeights` enum. The embedding table is stored
+**once** as int8 and the lookup dequantizes just the one row it needs, so it doubles as
+the `wcls` classifier under weight tying. On stories15M the int8 greedy output is
+identical to fp32.
+
+The host quantizes the fp32 checkpoint in memory and then **frees it**, so
+steady-state weight memory on stories15M drops from ~58 MiB to ~17 MiB (generation RSS
+~66 → ~21 MiB). Two honest caveats: (1) peak RSS is briefly *higher* during quantizing
+(the fp32 file and int8 buffers are both resident) — a pre-quantized on-disk format
+would avoid that; (2) this is *weight-only* int8 with scalar kernels, so it is **not**
+faster than fp32 here — the throughput win needs SIMD int8.
+
+Upcoming: SIMD int8 matmul, streaming-CLI polish, then `no_std` hardening polish.
 
 ## Workspace layout
 
@@ -90,6 +104,16 @@ cargo run --release -p host -- \
 
 Pass `--seed <N>` to make a sampled run reproducible (omit it for fresh
 randomness each run).
+
+Add `--quantize` to run the matmul weights as int8 (see Status). The optional
+`--group-size <N>` must divide the model's `dim`, `hidden_dim`, and `kv_dim`
+(default 32; for stories15M, 64 is rejected because 288 is not divisible by 64):
+
+```sh
+cargo run --release -p host -- \
+  models/stories15M.bin models/tokenizer.bin \
+  --prompt "Once upon a time" --quantize --group-size 32
+```
 
 **Inspect a checkpoint** (no `--prompt` → report mode):
 
