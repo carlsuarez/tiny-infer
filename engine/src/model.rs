@@ -15,7 +15,7 @@
 use crate::config::Config;
 use crate::math;
 use crate::quantize::{QuantizedTensor, QuantizedWeights};
-use crate::state::RunState;
+use crate::state::{QuantScratch, RunState};
 use crate::weights::Weights;
 
 /// Which projection weight a [`ModelWeights::matmul`] call should apply.
@@ -52,6 +52,27 @@ impl Proj {
             Proj::Wcls => (c.dim, c.vocab_size),
         }
     }
+}
+
+/// Which matmul implementation the forward pass should use.
+///
+/// Orthogonal to the weight representation ([`ModelWeights`]): each of the two
+/// representations has a scalar reference kernel and a `core::simd` kernel, so the
+/// full set is fp32 (`matmul`/`matmul_simd`) × int8 (`matmul_q8`/`matmul_q8_simd`).
+/// [`ModelWeights::matmul`] resolves the `(representation, kernel)` pair to one of the
+/// four. The choice does not affect token output beyond fp32 rounding noise; it is a
+/// speed/reference knob threaded through [`forward`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Kernel {
+    /// Straightforward scalar kernels — the readable reference path.
+    Scalar,
+    /// Vectorized `core::simd` kernels (8-wide `f32` lanes).
+    Simd,
+    /// x86 AVX-512 **VNNI** int8 kernel ([`math::matmul_q8_dotprod`]) for the `Q8`
+    /// path. The fp32 path and any group size not a multiple of 32 fall back to
+    /// [`Kernel::Simd`]; non-x86 targets fall back to it entirely. The std host only
+    /// selects this after detecting the CPU features at runtime.
+    Dotprod,
 }
 
 /// A model's weights in either representation, so a single [`forward`] serves both.
@@ -112,19 +133,55 @@ impl<'a> ModelWeights<'a> {
         }
     }
 
-    /// Apply projection `p` of layer `l`: `out = W · x`, using whichever matmul
-    /// kernel the representation calls for. For `wcls` (a single matrix) pass `l = 0`.
-    fn matmul(&self, p: Proj, l: usize, out: &mut [f32], x: &[f32], c: &Config) {
+    /// Apply projection `p` of layer `l`: `out = W · x`, dispatching on both the
+    /// weight representation and the requested [`Kernel`]. For `wcls` (a single
+    /// matrix) pass `l = 0`.
+    ///
+    /// On the int8 (`Q8`) path this is **W8A8**: the activation `x` is quantized into the
+    /// caller-provided [`QuantScratch`] and the matmul runs in integer arithmetic. `qs`
+    /// must be `Some` for `Q8` weights; the fp32 path ignores it (pass `None`).
+    // The projection (`p`/`l`), the I/O buffers (`out`/`x`), the config, and the two
+    // runtime knobs (`kernel`, `qs`) are all load-bearing — this is the dispatch seam, so
+    // a parameter just over clippy's heuristic threshold is expected here.
+    #[allow(clippy::too_many_arguments)]
+    fn matmul(
+        &self,
+        p: Proj,
+        l: usize,
+        out: &mut [f32],
+        x: &[f32],
+        c: &Config,
+        kernel: Kernel,
+        qs: Option<&mut QuantScratch>,
+    ) {
         let (d_in, d_out) = p.shape(c);
         match self {
             ModelWeights::F32(w) => {
                 let n = d_in * d_out;
                 let wl = &f32_proj(w, p)[l * n..l * n + n];
-                math::matmul(out, x, wl, d_in, d_out);
+                // The fp32 path has no integer kernel; Dotprod degrades to Simd here.
+                match kernel {
+                    Kernel::Scalar => math::matmul(out, x, wl, d_in, d_out),
+                    Kernel::Simd | Kernel::Dotprod => math::matmul_simd(out, x, wl, d_in, d_out),
+                }
             }
             ModelWeights::Q8(w) => {
                 let wl = q8_proj(w, p).layer(l, d_out, d_in);
-                math::matmul_q8(out, x, &wl, d_in, d_out);
+                // Quantize this matmul's activation to int8 once (values + per-group
+                // scales + per-group sums for the VNNI correction), then run the
+                // integer dot product against the int8 weights.
+                let qs = qs.expect("the Q8 forward path requires a QuantScratch");
+                let gs = wl.group_size;
+                let groups = d_in / gs;
+                let xqd = &mut qs.xq[..d_in];
+                let xqs = &mut qs.scales[..groups];
+                let xqg = &mut qs.gsums[..groups];
+                crate::quantize::quantize_activation(xqd, xqs, xqg, x, gs);
+                match kernel {
+                    Kernel::Scalar => math::matmul_q8(out, xqd, xqs, &wl, d_in, d_out),
+                    Kernel::Simd => math::matmul_q8_simd(out, xqd, xqs, &wl, d_in, d_out),
+                    Kernel::Dotprod => dotprod_q8(out, xqd, xqs, xqg, &wl, d_in, d_out),
+                }
             }
         }
     }
@@ -158,24 +215,53 @@ fn q8_proj<'a>(w: &QuantizedWeights<'a>, p: Proj) -> QuantizedTensor<'a> {
     }
 }
 
+/// Dispatch the int8 matmul to the AVX-512 VNNI kernel when it applies, else the
+/// portable SIMD kernel. VNNI handles 32 int8 lanes per instruction, so it needs a
+/// `group_size` that is a multiple of 32; other sizes (and non-x86 targets) fall back.
+fn dotprod_q8(
+    out: &mut [f32],
+    xq: &[i8],
+    xq_scales: &[f32],
+    xq_gsums: &[f32],
+    wl: &QuantizedTensor,
+    d_in: usize,
+    d_out: usize,
+) {
+    #[cfg(target_arch = "x86_64")]
+    if wl.group_size.is_multiple_of(32) {
+        // SAFETY: the std host only selects `Kernel::Dotprod` after detecting avx2 +
+        // avx512vl + avx512vnni at runtime; the group-size precondition is checked here.
+        unsafe { math::matmul_q8_dotprod(out, xq, xq_scales, xq_gsums, wl, d_in, d_out) };
+        return;
+    }
+    let _ = xq_gsums; // unused by the portable fallback
+    math::matmul_q8_simd(out, xq, xq_scales, wl, d_in, d_out);
+}
+
 /// Run one decoder step for `token` at sequence position `pos`.
 ///
-/// Works over either fp32 or int8 weights via [`ModelWeights`]. Writes this step's
-/// keys/values into `s.key_cache`/`s.value_cache` at `pos`, then attends over all
-/// cached positions `0..=pos`. Returns the logits row (`s.logits`, length
-/// `vocab_size`); the caller picks the next token (greedy = [`math::argmax`]).
+/// Works over either fp32 or int8 weights via [`ModelWeights`], and over the scalar,
+/// SIMD, or VNNI matmul kernels via [`Kernel`] (the choice is forwarded to every
+/// projection matmul; everything else is shared). Writes this step's keys/values into
+/// `s.key_cache`/`s.value_cache` at `pos`, then attends over all cached positions
+/// `0..=pos`. Returns the logits row (`s.logits`, length `vocab_size`); the caller
+/// picks the next token (greedy = [`math::argmax`]).
 ///
-/// `pos` must be `< config.seq_len` (the cache has exactly that many slots).
+/// `qs` is the int8 activation scratch: pass `Some` when `w` is [`ModelWeights::Q8`]
+/// (it panics otherwise) and `None` for the fp32 path. `pos` must be `< config.seq_len`
+/// (the cache has exactly that many slots).
 ///
 /// # Panics
-/// In debug builds, via the kernels' length assertions, if `s` was not built from
-/// this `config` or `pos` is out of range.
+/// In debug builds, via the kernels' length assertions, if `s` was not built from this
+/// `config` or `pos` is out of range; or if `w` is `Q8` and `qs` is `None`.
 pub fn forward<'s>(
     c: &Config,
     w: &ModelWeights,
     s: &'s mut RunState,
     token: usize,
     pos: usize,
+    kernel: Kernel,
+    qs: &mut Option<QuantScratch>,
 ) -> &'s [f32] {
     let dim = c.dim;
     let hidden_dim = c.hidden_dim;
@@ -200,9 +286,9 @@ pub fn forward<'s>(
         {
             let krow = &mut s.key_cache[kv_pos..kv_pos + kv_dim];
             let vrow = &mut s.value_cache[kv_pos..kv_pos + kv_dim];
-            w.matmul(Proj::Wq, l, s.q, s.xb, c);
-            w.matmul(Proj::Wk, l, krow, s.xb, c);
-            w.matmul(Proj::Wv, l, vrow, s.xb, c);
+            w.matmul(Proj::Wq, l, s.q, s.xb, c, kernel, qs.as_mut());
+            w.matmul(Proj::Wk, l, krow, s.xb, c, kernel, qs.as_mut());
+            w.matmul(Proj::Wv, l, vrow, s.xb, c, kernel, qs.as_mut());
             math::rope(s.q, krow, pos, head_size, dim, kv_dim);
         }
 
@@ -241,25 +327,25 @@ pub fn forward<'s>(
         }
 
         // Output projection and the first residual add.
-        w.matmul(Proj::Wo, l, s.xb2, s.xb, c);
+        w.matmul(Proj::Wo, l, s.xb2, s.xb, c, kernel, qs.as_mut());
         math::accumulate(s.x, s.xb2);
 
         // --- feed-forward (SwiGLU) ---
         let rms_ffn_l = &w.rms_ffn()[l * dim..l * dim + dim];
         math::rmsnorm(s.xb, s.x, rms_ffn_l);
 
-        w.matmul(Proj::W1, l, s.hb, s.xb, c);
-        w.matmul(Proj::W3, l, s.hb2, s.xb, c);
+        w.matmul(Proj::W1, l, s.hb, s.xb, c, kernel, qs.as_mut());
+        w.matmul(Proj::W3, l, s.hb2, s.xb, c, kernel, qs.as_mut());
         for i in 0..hidden_dim {
             s.hb[i] = math::silu(s.hb[i]) * s.hb2[i];
         }
-        w.matmul(Proj::W2, l, s.xb, s.hb, c);
+        w.matmul(Proj::W2, l, s.xb, s.hb, c, kernel, qs.as_mut());
         math::accumulate(s.x, s.xb);
     }
 
     // Final norm (into `xb` to avoid aliasing `x`), then classifier to logits.
     math::rmsnorm(s.xb, s.x, w.rms_final());
-    w.matmul(Proj::Wcls, 0, s.logits, s.xb, c);
+    w.matmul(Proj::Wcls, 0, s.logits, s.xb, c, kernel, qs.as_mut());
     &s.logits[..]
 }
 
@@ -314,7 +400,7 @@ mod tests {
         let mut arena = Arena::new(&mut arena_buf);
         let mut s = RunState::new(&mut arena, &c).unwrap();
 
-        let logits = forward(&c, &w, &mut s, 3, 0);
+        let logits = forward(&c, &w, &mut s, 3, 0, Kernel::Simd, &mut None);
         assert_eq!(logits.len(), c.vocab_size);
         assert!(logits.iter().all(|x| x.is_finite()));
     }
@@ -336,7 +422,7 @@ mod tests {
             let mut s = RunState::new(&mut arena, &c).unwrap();
             let mut out = Vec::new();
             for (pos, &tok) in toks.iter().enumerate() {
-                out.push(forward(&c, &w, &mut s, tok, pos).to_vec());
+                out.push(forward(&c, &w, &mut s, tok, pos, Kernel::Scalar, &mut None).to_vec());
             }
             out
         };
@@ -359,8 +445,8 @@ mod tests {
             let mut arena_buf = vec![0.0f32; crate::memory::arena_floats(&c)];
             let mut arena = Arena::new(&mut arena_buf);
             let mut s = RunState::new(&mut arena, &c).unwrap();
-            forward(&c, &w, &mut s, first, 0);
-            forward(&c, &w, &mut s, 7, 1).to_vec()
+            forward(&c, &w, &mut s, first, 0, Kernel::Simd, &mut None);
+            forward(&c, &w, &mut s, 7, 1, Kernel::Simd, &mut None).to_vec()
         };
 
         assert_ne!(run_pair(4), run_pair(5));
@@ -395,15 +481,19 @@ mod tests {
         let f32_w = ModelWeights::F32(fp32);
         let q8_w = ModelWeights::Q8(qw);
 
-        let logits = |w: &ModelWeights| -> Vec<f32> {
+        let logits = |w: &ModelWeights, kernel: Kernel| -> Vec<f32> {
             let mut arena_buf = vec![0.0f32; crate::memory::arena_floats(&c)];
             let mut arena = Arena::new(&mut arena_buf);
             let mut s = RunState::new(&mut arena, &c).unwrap();
-            forward(&c, w, &mut s, 3, 0).to_vec()
+            let n = crate::memory::max_proj_d_in(&c);
+            let (mut xq, mut sc, mut gs) = (vec![0i8; n], vec![0.0f32; n], vec![0.0f32; n]);
+            let scratch = QuantScratch::new(&mut xq, &mut sc, &mut gs, &c).unwrap();
+            let mut qs = matches!(w, ModelWeights::Q8(_)).then_some(scratch);
+            forward(&c, w, &mut s, 3, 0, kernel, &mut qs).to_vec()
         };
 
-        let a = logits(&f32_w);
-        let b = logits(&q8_w);
+        let a = logits(&f32_w, Kernel::Scalar);
+        let b = logits(&q8_w, Kernel::Simd);
         assert_eq!(b.len(), c.vocab_size);
         assert!(b.iter().all(|x| x.is_finite()));
         let max_diff = a
@@ -417,5 +507,51 @@ mod tests {
             max_diff < 0.02 * max_abs,
             "q8 logits drifted from fp32: max_diff={max_diff}, max_abs={max_abs}"
         );
+    }
+
+    #[test]
+    fn scalar_and_simd_kernels_agree() {
+        // The SIMD kernels differ from scalar only by floating-point reassociation,
+        // so the full-forward logits must match to within rounding for both the fp32
+        // and int8 representations.
+        use crate::quantize::{quantize_weights, quantized_scale_count, quantized_weight_count};
+
+        let c = tiny_config();
+        let wbuf = fake_weights(&c);
+        let fp32 = Weights::new(&wbuf, &c).unwrap();
+
+        let group_size = 4;
+        let mut data = vec![0i8; quantized_weight_count(&c)];
+        let mut scales = vec![0.0f32; quantized_scale_count(&c, group_size)];
+        quantize_weights(&fp32, &mut data, &mut scales, group_size, &c);
+        let qw = QuantizedWeights::new(
+            &data,
+            &scales,
+            fp32.rms_att,
+            fp32.rms_ffn,
+            fp32.rms_final,
+            group_size,
+            &c,
+        )
+        .unwrap();
+
+        let run = |w: &ModelWeights, kernel: Kernel| -> Vec<f32> {
+            let mut arena_buf = vec![0.0f32; crate::memory::arena_floats(&c)];
+            let mut arena = Arena::new(&mut arena_buf);
+            let mut s = RunState::new(&mut arena, &c).unwrap();
+            let n = crate::memory::max_proj_d_in(&c);
+            let (mut xq, mut sc, mut gs) = (vec![0i8; n], vec![0.0f32; n], vec![0.0f32; n]);
+            let scratch = QuantScratch::new(&mut xq, &mut sc, &mut gs, &c).unwrap();
+            let mut qs = matches!(w, ModelWeights::Q8(_)).then_some(scratch);
+            forward(&c, w, &mut s, 3, 0, kernel, &mut qs).to_vec()
+        };
+
+        for w in [ModelWeights::F32(fp32), ModelWeights::Q8(qw)] {
+            let scalar = run(&w, Kernel::Scalar);
+            let simd = run(&w, Kernel::Simd);
+            for (x, y) in scalar.iter().zip(&simd) {
+                assert!((x - y).abs() < 1e-4, "{x} vs {y}");
+            }
+        }
     }
 }

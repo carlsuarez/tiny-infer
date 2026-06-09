@@ -18,9 +18,9 @@ use std::process::ExitCode;
 use std::time::Instant;
 
 use engine::math::{argmax, maxf};
-use engine::memory::{arena_floats, MemoryBudget};
+use engine::memory::{arena_floats, max_proj_d_in, MemoryBudget};
 use engine::quantize::{quantize_weights, quantized_scale_count, quantized_weight_count};
-use engine::{forward, Arena, Config, ModelWeights, RunState};
+use engine::{forward, Arena, Config, Kernel, ModelWeights, QuantScratch, RunState};
 use rand::rngs::StdRng;
 use rand::{RngExt, SeedableRng};
 
@@ -53,6 +53,10 @@ OPTIONS:
                               (scalar int8 is not faster than fp32; the win is memory)
         --group-size <N>      Int8 quantization group size; must divide the model's
                               dim, hidden_dim, and kv_dim (default: 32)
+        --scalar              Use the scalar matmul kernels instead of the default
+                              SIMD (core::simd) ones — the readable reference path
+        --dotprod             Use the x86 AVX-512 VNNI int8 kernel for --quantize
+                              (falls back to SIMD if the CPU lacks VNNI)
     -h, --help                Print this help and exit
 
 With no --prompt, tiny-infer prints the model config, validates the files, and
@@ -92,6 +96,7 @@ fn run() -> Result<(), HostError> {
         })?;
         let vocab = Vocab::load(&tok_path, config.vocab_size)?;
         let sampler = Sampler::new(config.vocab_size, args.temperature, args.topp, args.seed);
+        let kernel = select_kernel(args.scalar, args.dotprod);
 
         if args.quantize {
             let gs = args.group_size;
@@ -122,6 +127,7 @@ fn run() -> Result<(), HostError> {
                 prompt,
                 args.steps,
                 sampler,
+                kernel,
             );
         }
 
@@ -133,6 +139,7 @@ fn run() -> Result<(), HostError> {
             prompt,
             args.steps,
             sampler,
+            kernel,
         );
     }
 
@@ -164,6 +171,7 @@ fn generate(
     prompt: &str,
     steps: Option<usize>,
     mut sampler: Sampler,
+    kernel: Kernel,
 ) -> Result<(), HostError> {
     // `encode` always yields at least the BOS token, so `prompt_tokens[0]` is safe.
     let prompt_tokens = vocab.encode(prompt, true);
@@ -175,6 +183,18 @@ fn generate(
     let mut state =
         RunState::new(&mut arena, config).map_err(|e| HostError::engine("<arena>", e))?;
 
+    // The int8 (W8A8) path needs a per-matmul activation scratch; allocate it only when
+    // the weights are quantized so an fp32 run carries none of it.
+    let n = max_proj_d_in(config);
+    let mut qbuf = matches!(weights, ModelWeights::Q8(_))
+        .then(|| (vec![0i8; n], vec![0.0f32; n], vec![0.0f32; n]));
+    let mut scratch = match qbuf.as_mut() {
+        Some((xq, sc, gs)) => Some(
+            QuantScratch::new(xq, sc, gs, config).map_err(|e| HostError::engine("<arena>", e))?,
+        ),
+        None => None,
+    };
+
     let stdout = io::stdout();
     let mut out = stdout.lock();
 
@@ -182,7 +202,7 @@ fn generate(
     let mut token = prompt_tokens[0];
     let mut pos = 0usize;
     while pos < steps {
-        let logits = forward(config, weights, &mut state, token, pos);
+        let logits = forward(config, weights, &mut state, token, pos, kernel, &mut scratch);
         let next = if pos + 1 < prompt_tokens.len() {
             prompt_tokens[pos + 1] // still replaying the prompt
         } else {
@@ -396,6 +416,37 @@ fn report_memory(model: &Model) {
     );
 }
 
+/// Pick the matmul kernel from the flags, with a graceful fallback when `--dotprod`
+/// is requested on a CPU without AVX-512 VNNI.
+///
+/// `--scalar` wins outright (reference path). `--dotprod` selects the int8 VNNI kernel
+/// only when the CPU supports it (it falls back to SIMD inside the engine for the fp32
+/// path and odd group sizes); otherwise it warns and uses SIMD. The default is SIMD.
+fn select_kernel(scalar: bool, dotprod: bool) -> Kernel {
+    if scalar {
+        return Kernel::Scalar;
+    }
+    if dotprod {
+        if vnni_available() {
+            return Kernel::Dotprod;
+        }
+        eprintln!("[--dotprod: CPU lacks AVX-512 VNNI; using SIMD instead]");
+    }
+    Kernel::Simd
+}
+
+/// Whether this CPU has the AVX-512 VNNI + VL features the int8 dot-product kernel needs.
+#[cfg(target_arch = "x86_64")]
+fn vnni_available() -> bool {
+    std::is_x86_feature_detected!("avx512vnni") && std::is_x86_feature_detected!("avx512vl")
+}
+
+/// Non-x86 targets have no VNNI path; the engine falls back to its portable kernels.
+#[cfg(not(target_arch = "x86_64"))]
+fn vnni_available() -> bool {
+    false
+}
+
 /// Reject a quantization group size that does not evenly divide the weight
 /// dimensions. Quantization groups never straddle a row, so the group size must
 /// divide every matmul's input dimension; otherwise the int8 tensors would be
@@ -473,6 +524,8 @@ struct Args {
     seed: Option<u64>,
     quantize: bool,
     group_size: usize,
+    scalar: bool,
+    dotprod: bool,
     help: bool,
 }
 
@@ -487,6 +540,8 @@ impl Args {
         let mut seed = None;
         let mut quantize = false;
         let mut group_size = 32usize;
+        let mut scalar = false;
+        let mut dotprod = false;
         let mut help = false;
         let mut positionals = Vec::new();
 
@@ -504,6 +559,8 @@ impl Args {
                 "--topp" => topp = parse_f32(&expect_value(&mut it, &arg)?, &arg)?,
                 "--seed" => seed = Some(parse_u64(&expect_value(&mut it, &arg)?, &arg)?),
                 "-q" | "--quantize" => quantize = true,
+                "--scalar" => scalar = true,
+                "--dotprod" => dotprod = true,
                 "--group-size" => {
                     group_size = parse_usize(&expect_value(&mut it, &arg)?, &arg)?
                 }
@@ -550,6 +607,8 @@ impl Args {
             seed,
             quantize,
             group_size,
+            scalar,
+            dotprod,
             help,
         })
     }
@@ -661,10 +720,17 @@ mod tests {
         let def = parse(&["m.bin"]).unwrap();
         assert!(!def.quantize);
         assert_eq!(def.group_size, 32);
+        assert!(!def.scalar); // SIMD kernels by default
+        assert!(!def.dotprod);
 
-        let a = parse(&["m.bin", "-q", "--group-size", "64"]).unwrap();
+        let a = parse(&["m.bin", "-q", "--group-size", "64", "--scalar"]).unwrap();
         assert!(a.quantize);
         assert_eq!(a.group_size, 64);
+        assert!(a.scalar);
+
+        let d = parse(&["m.bin", "-q", "--dotprod"]).unwrap();
+        assert!(d.dotprod);
+        assert!(!d.scalar);
 
         let b = parse(&["m.bin", "--quantize", "--group-size=96"]).unwrap();
         assert!(b.quantize);

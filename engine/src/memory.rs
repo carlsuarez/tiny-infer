@@ -23,6 +23,10 @@ const F32: usize = core::mem::size_of::<f32>();
 /// | `q`     | `att_dim`   | query for the current position         |
 /// | `att`   | `heads*seq` | attention scores per head              |
 /// | `logits`| `vocab`     | output distribution                    |
+///
+/// The int8 (W8A8) path's activation scratch is *not* part of this arena — it lives in a
+/// separate, caller-owned [`QuantScratch`](crate::QuantScratch), so an fp32 run budgets
+/// none of it.
 pub fn activation_floats(c: &Config) -> usize {
     let att_dim = c.n_heads * c.head_size();
     3 * c.dim                 // x, xb, xb2
@@ -30,6 +34,15 @@ pub fn activation_floats(c: &Config) -> usize {
         + att_dim             // q
         + c.n_heads * c.seq_len // att
         + c.vocab_size // logits
+}
+
+/// The largest matmul input dimension `d_in` across all projections — the size each
+/// buffer of the W8A8 activation scratch ([`QuantScratch`](crate::QuantScratch)) must
+/// cover.
+pub fn max_proj_d_in(c: &Config) -> usize {
+    let att_dim = c.n_heads * c.head_size();
+    // Wq/Wk/Wv/W1/W3/Wcls take `dim`; Wo takes `att_dim`; W2 takes `hidden_dim`.
+    c.dim.max(att_dim).max(c.hidden_dim)
 }
 
 /// Number of `f32` in the KV cache: key and value caches, each
@@ -106,9 +119,11 @@ mod tests {
     #[test]
     fn activation_budget_matches_hand_count() {
         let c = stories15m();
-        // 3*288 + 2*768 + 288 + 6*256 + 32000
+        // 3*288 + 2*768 + 288 + 6*256 + 32000  (fp32 working set; int8 scratch is separate)
         let expect = 864 + 1536 + 288 + 1536 + 32000;
         assert_eq!(activation_floats(&c), expect);
+        // max_d_in = max(dim=288, att_dim=288, hidden=768) = 768 sizes the QuantScratch.
+        assert_eq!(max_proj_d_in(&c), 768);
     }
 
     #[test]

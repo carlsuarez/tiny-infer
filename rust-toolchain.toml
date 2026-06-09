@@ -1,0 +1,9 @@
+# The engine's SIMD kernels use `core::simd` (the `portable_simd` feature), which
+# is still nightly-only. Pinning nightly keeps `cargo build`/`test`/`clippy` working
+# across machines without a manual `+nightly`. The thumbv7em target component is here
+# so the no_std embedded build (`cargo build -p engine --target thumbv7em-none-eabi`)
+# works out of the box too.
+[toolchain]
+channel = "nightly"
+components = ["clippy", "rustfmt"]
+targets = ["thumbv7em-none-eabi"]

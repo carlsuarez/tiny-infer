@@ -17,6 +17,9 @@
 //! [`forward`] pass that turns a token into vocabulary logits.
 
 #![no_std]
+// The SIMD matmul kernels in `math` use `core::simd`, which is still nightly-only;
+// the workspace pins a nightly toolchain (see `rust-toolchain.toml`).
+#![feature(portable_simd)]
 #![forbid(unsafe_op_in_unsafe_fn)]
 #![warn(missing_docs)]
 
@@ -33,7 +36,7 @@ pub mod weights;
 pub use arena::Arena;
 pub use config::Config;
 pub use error::EngineError;
-pub use model::{forward, ModelWeights};
+pub use model::{forward, Kernel, ModelWeights};
 pub use quantize::{QuantizedTensor, QuantizedWeights};
-pub use state::RunState;
+pub use state::{QuantScratch, RunState};
 pub use weights::Weights;

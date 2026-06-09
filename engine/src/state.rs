@@ -52,6 +52,10 @@ impl<'buf> RunState<'buf> {
     /// [`crate::memory::arena_floats`]. Returns [`EngineError::ArenaOverflow`] if
     /// the arena was sized too small (size it with `arena_floats` to guarantee a
     /// fit).
+    /// Carve every buffer out of `arena` for the given config.
+    ///
+    /// This is the fp32 working set only; the int8 path's activation scratch lives in a
+    /// separate [`QuantScratch`] so an fp32 run neither allocates nor budgets for it.
     pub fn new(arena: &mut Arena<'buf>, c: &Config) -> Result<RunState<'buf>, EngineError> {
         let att_dim = c.n_heads * c.head_size();
         let kv_cache = c.n_layers * c.seq_len * c.kv_dim();
@@ -68,6 +72,50 @@ impl<'buf> RunState<'buf> {
             key_cache: arena.alloc(kv_cache)?,
             value_cache: arena.alloc(kv_cache)?,
         })
+    }
+}
+
+/// Per-matmul activation scratch for the int8 (W8A8) path — separate from [`RunState`]
+/// so the fp32 path carries none of it.
+///
+/// Holds the quantized activation (`xq`, `i8`) plus its per-group `scales` and per-group
+/// integer `gsums` (the VNNI correction term), all filled fresh by
+/// [`quantize_activation`](crate::quantize::quantize_activation) before each int8 matmul.
+/// All three buffers are caller-owned (the arena vends only `f32`, and `xq` is `i8`), and
+/// each must be at least [`max_proj_d_in`](crate::memory::max_proj_d_in) long. Build one
+/// only when generating with `--quantize`; pass `None` to [`forward`](crate::forward) on
+/// the fp32 path.
+#[derive(Debug)]
+pub struct QuantScratch<'buf> {
+    /// Quantized activation values, `i8`.
+    pub xq: &'buf mut [i8],
+    /// Per-group activation scales.
+    pub scales: &'buf mut [f32],
+    /// Per-group activation integer sums (VNNI `−128·Σa` correction).
+    pub gsums: &'buf mut [f32],
+}
+
+impl<'buf> QuantScratch<'buf> {
+    /// Bundle three caller-owned buffers as an activation scratch.
+    ///
+    /// Each buffer must be at least [`max_proj_d_in`](crate::memory::max_proj_d_in) long
+    /// (the largest matmul input dimension, with one group per element in the worst
+    /// case). Returns [`EngineError::ArenaOverflow`] if any is short.
+    pub fn new(
+        xq: &'buf mut [i8],
+        scales: &'buf mut [f32],
+        gsums: &'buf mut [f32],
+        c: &Config,
+    ) -> Result<QuantScratch<'buf>, EngineError> {
+        let need = crate::memory::max_proj_d_in(c);
+        let have = xq.len().min(scales.len()).min(gsums.len());
+        if have < need {
+            return Err(EngineError::ArenaOverflow {
+                requested: need,
+                available: have,
+            });
+        }
+        Ok(QuantScratch { xq, scales, gsums })
     }
 }
 
@@ -120,9 +168,24 @@ mod tests {
         let mut buf = vec![0.0f32; total];
         let mut arena = Arena::new(&mut buf);
         let _s = RunState::new(&mut arena, &c).unwrap();
-        // The budget is exact: nothing left over, nothing short.
+        // The budget is exact: nothing left over, nothing short. (The int8 activation
+        // scratch is a separate `QuantScratch`, not part of the fp32 arena.)
         assert_eq!(arena.used(), total);
         assert_eq!(arena.remaining(), 0);
+    }
+
+    #[test]
+    fn quant_scratch_checks_buffer_lengths() {
+        let c = tiny_config();
+        let need = crate::memory::max_proj_d_in(&c);
+        let (mut xq, mut sc, mut gs) = (vec![0i8; need], vec![0.0f32; need], vec![0.0f32; need]);
+        assert!(QuantScratch::new(&mut xq, &mut sc, &mut gs, &c).is_ok());
+
+        let mut short = vec![0i8; need - 1];
+        assert!(matches!(
+            QuantScratch::new(&mut short, &mut sc, &mut gs, &c),
+            Err(EngineError::ArenaOverflow { .. })
+        ));
     }
 
     #[test]

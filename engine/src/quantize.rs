@@ -127,6 +127,64 @@ pub fn quantize(data: &mut [i8], scales: &mut [f32], x: &[f32], group_size: usiz
     }
 }
 
+/// Quantize activations `x` into int8 `out` + per-group `scales` + per-group integer
+/// `gsums`, in a single pass.
+///
+/// The activation-side counterpart of [`quantize`], called once per matmul on the W8A8
+/// path. Same scheme (symmetric, group-wise, `scale = max(|x|)/127`, round to nearest),
+/// producing the same `out`/`scales` as [`quantize`]. It *additionally* records, per
+/// group, the **sum of the quantized int8 values** in `gsums` (held as exact `f32`).
+/// That sum is the correction term the VNNI dot-product kernel needs: hardware
+/// `vpdpbusd` multiplies *unsigned* × *signed* bytes, so the kernel offsets each weight
+/// by `+128` and subtracts `128 · Σ(activations)` per group to recover the true signed
+/// dot product. The scalar/SIMD kernels ignore `gsums`.
+///
+/// Writes `x.len()` values into `out` and `x.len() / group_size` entries into each of
+/// `scales` and `gsums`. `x.len()` must be a multiple of `group_size`.
+///
+/// # Panics
+/// In debug builds, if the slice lengths are inconsistent with `group_size`.
+pub fn quantize_activation(
+    out: &mut [i8],
+    scales: &mut [f32],
+    gsums: &mut [f32],
+    x: &[f32],
+    group_size: usize,
+) {
+    debug_assert_eq!(out.len(), x.len());
+    debug_assert_eq!(x.len() % group_size, 0);
+    debug_assert_eq!(scales.len(), x.len() / group_size);
+    debug_assert_eq!(gsums.len(), x.len() / group_size);
+
+    const Q_MAX: f32 = 127.0;
+
+    for (g, group) in x.chunks_exact(group_size).enumerate() {
+        let mut wmax = 0.0f32;
+        for &v in group {
+            let a = libm::fabsf(v);
+            if a > wmax {
+                wmax = a;
+            }
+        }
+        let scale = wmax / Q_MAX;
+        scales[g] = scale;
+
+        let base = g * group_size;
+        let mut sum: i32 = 0;
+        for (k, &v) in group.iter().enumerate() {
+            // All-zero group: scale==0, skip the divide so it can't make a NaN.
+            let q = if scale != 0.0 {
+                libm::roundf(v / scale) as i8
+            } else {
+                0
+            };
+            out[base + k] = q;
+            sum += q as i32;
+        }
+        gsums[g] = sum as f32;
+    }
+}
+
 /// Dequantize `qx` back into `out`: `out[k] = data[k] as f32 * scales[k/group_size]`.
 ///
 /// The inverse of [`quantize`]; used mainly to measure round-trip error in tests.
@@ -376,6 +434,27 @@ mod tests {
                 "i={i}: {orig} vs {deq}"
             );
         }
+    }
+
+    #[test]
+    fn quantize_activation_matches_weight_quantizer_and_sums_groups() {
+        // The activation quantizer must produce the same int8 values and scales as the
+        // weight quantizer, plus the per-group integer sum used by the VNNI correction.
+        let x: Vec<f32> = (0..8).map(|i| (i as f32 - 3.5) * 0.7).collect();
+        let mut qi = vec![0i8; 8];
+        let mut si = vec![0.0f32; 2];
+        quantize(&mut qi, &mut si, &x, 4);
+
+        let mut qa = vec![0i8; 8];
+        let mut sa = vec![0.0f32; 2];
+        let mut gsums = vec![0.0f32; 2];
+        quantize_activation(&mut qa, &mut sa, &mut gsums, &x, 4);
+
+        assert_eq!(qi, qa);
+        assert_eq!(si, sa);
+        // gsums[g] is the exact integer sum of that group's quantized values.
+        assert_eq!(gsums[0], qa[..4].iter().map(|&v| v as i32).sum::<i32>() as f32);
+        assert_eq!(gsums[1], qa[4..].iter().map(|&v| v as i32).sum::<i32>() as f32);
     }
 
     #[test]

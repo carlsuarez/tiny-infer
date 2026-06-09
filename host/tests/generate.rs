@@ -210,6 +210,32 @@ fn quantized_greedy_generation_produces_coherent_text() {
 }
 
 #[test]
+fn dotprod_int8_matches_the_simd_int8_output() {
+    let (Some(model), Some(tok)) = (fixture("stories15M.bin"), fixture("tokenizer.bin")) else {
+        eprintln!("skipping: fixtures not present");
+        return;
+    };
+
+    // The VNNI (--dotprod) kernel computes the exact same integer dot product as the
+    // portable int8 kernels, so its greedy output must be byte-identical. On a CPU
+    // without AVX-512 VNNI, --dotprod transparently falls back to SIMD, which also
+    // makes the two identical — so this assertion holds on any x86-64 host.
+    let run = |extra: &[&str]| -> String {
+        let out = Command::new(BIN)
+            .arg(&model)
+            .arg(&tok)
+            .args(["-p", "Once upon a time", "-n", "48", "--quantize"])
+            .args(extra)
+            .output()
+            .unwrap();
+        assert!(out.status.success(), "stderr: {}", String::from_utf8_lossy(&out.stderr));
+        String::from_utf8(out.stdout).expect("output is valid UTF-8")
+    };
+
+    assert_eq!(run(&[]), run(&["--dotprod"]), "dotprod int8 output diverged from SIMD int8");
+}
+
+#[test]
 fn invalid_group_size_is_a_usage_error() {
     let (Some(model), Some(tok)) = (fixture("stories15M.bin"), fixture("tokenizer.bin")) else {
         eprintln!("skipping: fixtures not present");
