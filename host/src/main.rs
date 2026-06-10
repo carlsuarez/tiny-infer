@@ -55,8 +55,9 @@ OPTIONS:
                               dim, hidden_dim, and kv_dim (default: 32)
         --scalar              Use the scalar matmul kernels instead of the default
                               SIMD (core::simd) ones — the readable reference path
-        --dotprod             Use the x86 AVX-512 VNNI int8 kernel for --quantize
-                              (falls back to SIMD if the CPU lacks VNNI)
+        --dotprod             Use the hardware int8 dot-product kernel for --quantize
+                              (x86 AVX-512 VNNI or ARM NEON sdot; falls back to SIMD
+                              if the CPU has neither)
     -h, --help                Print this help and exit
 
 With no --prompt, tiny-infer prints the model config, validates the files, and
@@ -417,33 +418,40 @@ fn report_memory(model: &Model) {
 }
 
 /// Pick the matmul kernel from the flags, with a graceful fallback when `--dotprod`
-/// is requested on a CPU without AVX-512 VNNI.
+/// is requested on a CPU without a hardware int8 dot-product instruction.
 ///
-/// `--scalar` wins outright (reference path). `--dotprod` selects the int8 VNNI kernel
-/// only when the CPU supports it (it falls back to SIMD inside the engine for the fp32
-/// path and odd group sizes); otherwise it warns and uses SIMD. The default is SIMD.
+/// `--scalar` wins outright (reference path). `--dotprod` selects the int8 dot-product
+/// kernel only when the CPU supports it — x86 AVX-512 VNNI or ARM NEON `sdot` (the engine
+/// still falls back to SIMD internally for the fp32 path and x86 group sizes VNNI can't
+/// take); otherwise it warns and uses SIMD. The default is SIMD.
 fn select_kernel(scalar: bool, dotprod: bool) -> Kernel {
     if scalar {
         return Kernel::Scalar;
     }
     if dotprod {
-        if vnni_available() {
+        if dotprod_available() {
             return Kernel::Dotprod;
         }
-        eprintln!("[--dotprod: CPU lacks AVX-512 VNNI; using SIMD instead]");
+        eprintln!("[--dotprod: CPU lacks a hardware int8 dot-product instruction; using SIMD instead]");
     }
     Kernel::Simd
 }
 
-/// Whether this CPU has the AVX-512 VNNI + VL features the int8 dot-product kernel needs.
+/// Whether this CPU has the AVX-512 VNNI + VL features the x86 int8 kernel needs.
 #[cfg(target_arch = "x86_64")]
-fn vnni_available() -> bool {
+fn dotprod_available() -> bool {
     std::is_x86_feature_detected!("avx512vnni") && std::is_x86_feature_detected!("avx512vl")
 }
 
-/// Non-x86 targets have no VNNI path; the engine falls back to its portable kernels.
-#[cfg(not(target_arch = "x86_64"))]
-fn vnni_available() -> bool {
+/// Whether this CPU has the NEON `dotprod` extension the ARM `sdot` int8 kernel needs.
+#[cfg(target_arch = "aarch64")]
+fn dotprod_available() -> bool {
+    std::arch::is_aarch64_feature_detected!("dotprod")
+}
+
+/// Other targets have no hardware int8 dot product; the engine falls back to SIMD.
+#[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
+fn dotprod_available() -> bool {
     false
 }
 

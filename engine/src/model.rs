@@ -68,10 +68,12 @@ pub enum Kernel {
     Scalar,
     /// Vectorized `core::simd` kernels (8-wide `f32` lanes).
     Simd,
-    /// x86 AVX-512 **VNNI** int8 kernel ([`math::matmul_q8_dotprod`]) for the `Q8`
-    /// path. The fp32 path and any group size not a multiple of 32 fall back to
-    /// [`Kernel::Simd`]; non-x86 targets fall back to it entirely. The std host only
-    /// selects this after detecting the CPU features at runtime.
+    /// Hardware int8 **dot-product** kernel ([`math::matmul_q8_dotprod`]) for the `Q8`
+    /// path — x86 AVX-512 **VNNI** or ARM NEON **`sdot`**. The fp32 path always falls
+    /// back to [`Kernel::Simd`], as does the x86 kernel for any group size not a multiple
+    /// of 32; the ARM kernel handles any group size. Targets with neither instruction
+    /// fall back to SIMD entirely. The std host only selects this after detecting the CPU
+    /// feature at runtime.
     Dotprod,
 }
 
@@ -215,9 +217,16 @@ fn q8_proj<'a>(w: &QuantizedWeights<'a>, p: Proj) -> QuantizedTensor<'a> {
     }
 }
 
-/// Dispatch the int8 matmul to the AVX-512 VNNI kernel when it applies, else the
-/// portable SIMD kernel. VNNI handles 32 int8 lanes per instruction, so it needs a
-/// `group_size` that is a multiple of 32; other sizes (and non-x86 targets) fall back.
+/// Dispatch the int8 matmul to a hardware dot-product kernel when one applies, else the
+/// portable SIMD kernel. The two hardware kernels differ in shape, so this is the single
+/// place that reconciles them:
+///
+/// * **x86 AVX-512 VNNI** (`vpdpbusd`): unsigned×signed, so it consumes the per-group
+///   `xq_gsums` correction and needs a `group_size` that is a multiple of 32 — other
+///   sizes fall through to SIMD.
+/// * **ARM NEON `sdot`**: signed×signed, so it ignores `xq_gsums` entirely and its scalar
+///   tail covers any `group_size`.
+/// * **Everything else** (and the `thumbv7em` embedded build): portable SIMD.
 fn dotprod_q8(
     out: &mut [f32],
     xq: &[i8],
@@ -234,8 +243,21 @@ fn dotprod_q8(
         unsafe { math::matmul_q8_dotprod(out, xq, xq_scales, xq_gsums, wl, d_in, d_out) };
         return;
     }
-    let _ = xq_gsums; // unused by the portable fallback
-    math::matmul_q8_simd(out, xq, xq_scales, wl, d_in, d_out);
+
+    #[cfg(target_arch = "aarch64")]
+    {
+        let _ = xq_gsums; // sdot is signed×signed — no +128 correction needed
+        // SAFETY: the std host only selects `Kernel::Dotprod` after detecting the NEON
+        // `dotprod` feature at runtime.
+        unsafe { math::matmul_q8_dotprod(out, xq, xq_scales, wl, d_in, d_out) };
+    }
+
+    // SIMD fallback for non-aarch64 targets (and x86 group sizes VNNI can't take above).
+    #[cfg(not(target_arch = "aarch64"))]
+    {
+        let _ = xq_gsums; // unused by the portable fallback
+        math::matmul_q8_simd(out, xq, xq_scales, wl, d_in, d_out);
+    }
 }
 
 /// Run one decoder step for `token` at sequence position `pos`.

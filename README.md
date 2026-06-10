@@ -48,38 +48,44 @@ on the fly ([`quantize_activation`]), accumulates the dot product in `i32`, then
 both scales — the scheme in llama2.c `runq.c`. On stories15M the greedy output still
 keeps the golden story opening.
 
-**Matmul kernels — scalar, SIMD, and VNNI.** The matrix–vector products (the bulk of the
-work) have three implementations, selected per run via `engine::Kernel`:
+**Matmul kernels — scalar, SIMD, and hardware dot-product.** The matrix–vector products
+(the bulk of the work) have three implementations, selected per run via `engine::Kernel`:
 
 - **scalar** — the readable reference (`--scalar`).
 - **SIMD** — `core::simd` / `portable_simd`, 8-wide lanes (the default). Because
   `core::simd` is nightly-only, the workspace pins a nightly toolchain (`rust-toolchain.toml`).
-- **VNNI** — for the int8 path, an x86 AVX-512 **VNNI** kernel (`vpdpbusd`) via
-  `core::arch` intrinsics (`--dotprod`). `vpdpbusd` does 32 int8 multiply-accumulates into
-  `i32` per instruction. It multiplies *unsigned × signed*, so the kernel offsets each
-  weight by `+128` in-register and subtracts a per-group `128·Σ(activations)` correction —
-  the integer dot product comes out **bit-identical** to the scalar kernel. The std host
-  runtime-detects VNNI and falls back to SIMD when it (or a non-multiple-of-32 group size)
-  is unavailable; the kernel is the engine's only `unsafe`, and it is cfg-gated to x86-64.
+- **dot-product** — for the int8 path, a hardware int8 dot-product kernel via `core::arch`
+  intrinsics (`--dotprod`), one per architecture:
+  - **x86 AVX-512 VNNI** (`vpdpbusd`): 32 int8 multiply-accumulates into `i32` per
+    instruction. It multiplies *unsigned × signed*, so the kernel offsets each weight by
+    `+128` in-register and subtracts a per-group `128·Σ(activations)` correction.
+  - **ARM NEON `sdot`** (`vdotq_s32`): 16 int8 multiply-accumulates into `i32` per
+    instruction. `sdot` multiplies *signed × signed* directly, so there is **no** offset
+    correction (and no group-size restriction — a scalar tail covers any remainder).
+
+  Either way the integer dot product comes out **bit-identical** to the scalar kernel. The
+  std host runtime-detects the feature and falls back to SIMD when it (or, on x86, a
+  non-multiple-of-32 group size) is unavailable. These two kernels are the engine's only
+  `unsafe`, each cfg-gated to its target arch.
 
 Measured on stories15M (release, 256 tokens, x86-64 with AVX-512 VNNI):
 
-| kernel       | scalar     | SIMD       | VNNI (`--dotprod`) |
-| ---          | ---        | ---        | ---                |
-| fp32         | ~124 tok/s | ~520 tok/s | —                  |
-| int8 (W8A8)  | ~231 tok/s | ~556 tok/s | **~835 tok/s**     |
+| kernel       | scalar     | SIMD       | dot-product (`--dotprod`) |
+| ---          | ---        | ---        | ---                       |
+| fp32         | ~124 tok/s | ~520 tok/s | —                         |
+| int8 (W8A8)  | ~231 tok/s | ~556 tok/s | **~835 tok/s** (VNNI)     |
 
-So int8 is now both a **memory** win (~3× smaller weights) *and*, with VNNI, a **speed**
-win: ~835 tok/s is ~1.6× the fp32 SIMD path and ~3.6× the scalar int8 baseline. (Without a
-hardware int8 dot — i.e. portable `i32x8` `pmulld` — int8 only matches fp32; the dedicated
-`vpdpbusd` instruction is what makes it pull ahead. On a non-VNNI CPU `--dotprod`
-transparently falls back to SIMD.) Greedy output stays coherent and identical across all
-kernels.
+So int8 is both a **memory** win (~3× smaller weights) *and*, with a hardware int8 dot, a
+**speed** win: ~835 tok/s is ~1.6× the fp32 SIMD path and ~3.6× the scalar int8 baseline.
+(Without a hardware int8 dot — i.e. portable `i32x8` `pmulld` — int8 only matches fp32; the
+dedicated `vpdpbusd`/`sdot` instruction is what makes it pull ahead. On a CPU with neither,
+`--dotprod` transparently falls back to SIMD.) Greedy output stays coherent and identical
+across all kernels. (The ARM `sdot` kernel mirrors the VNNI path and is bit-exact by
+construction; throughput is unbenchmarked here, as the dev machine is x86-64 only.)
 
 [`quantize_activation`]: engine/src/quantize.rs
 
-Upcoming: an ARM **dotprod** (`sdot`) int8 kernel for the same win on aarch64, streaming-CLI
-polish, then `no_std` hardening polish.
+Upcoming: streaming-CLI polish, then `no_std` hardening polish.
 
 ## Workspace layout
 
@@ -151,8 +157,9 @@ cargo run --release -p host -- \
 ```
 
 The matmul kernels are SIMD (`core::simd`) by default; add `--scalar` for the readable
-reference kernels, or `--dotprod` to run int8 through the x86 AVX-512 VNNI kernel — the
-fastest path on a VNNI CPU (same output; see the table above).
+reference kernels, or `--dotprod` to run int8 through the hardware dot-product kernel
+(x86 AVX-512 VNNI or ARM NEON `sdot`) — the fastest path on a CPU that has one (same
+output; see the table above).
 
 **Inspect a checkpoint** (no `--prompt` → report mode):
 

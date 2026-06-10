@@ -11,8 +11,15 @@
 //! int8-quantized ([`matmul_q8`] / [`matmul_q8_simd`]) matmuls have both. The scalar
 //! kernels are the readable reference; the SIMD kernels widen the inner dot product
 //! to 8 lanes of `f32` and fall back to scalar for any tail that does not fill a lane.
-//! The two produce the same result up to floating-point reassociation. The caller
+//! The fp32 pair agree up to floating-point reassociation; the int8 pair agree
+//! **exactly** (integer accumulation is associative). The caller
 //! ([`crate::ModelWeights::matmul`]) picks which via [`crate::Kernel`].
+//!
+//! The int8 matmul additionally has a hardware **dot-product** kernel, selected by
+//! [`Kernel::Dotprod`](crate::Kernel): x86 AVX-512 VNNI (`vpdpbusd`) and ARM NEON
+//! `sdot`, both [`matmul_q8_dotprod`] (one per `cfg(target_arch)`). They run the same
+//! exact integer dot product as the scalar kernel, just far faster, and the std host
+//! only selects them after detecting the CPU feature at runtime.
 //!
 //! The remaining kernels follow Karpathy's llama2.c `run.c` operation-for-operation;
 //! the details that matter for token-for-token parity at temperature 0 are called
@@ -27,12 +34,19 @@ use core::simd::{f32x8, i32x8, i8x8};
 #[cfg(target_arch = "x86_64")]
 use core::arch::x86_64::*;
 
+#[cfg(target_arch = "aarch64")]
+use core::arch::aarch64::*;
+
 /// SIMD width (lanes) used by the vectorized matmuls.
 const LANES: usize = 8;
 
 /// Byte width of an AVX2/AVX-512 256-bit int8 lane — the chunk size of the VNNI kernel.
 #[cfg(target_arch = "x86_64")]
 const VNNI_LANES: usize = 32;
+
+/// Byte width of one NEON `sdot` int8 chunk — 16 bytes per `int8x16` register.
+#[cfg(target_arch = "aarch64")]
+const SDOT_LANES: usize = 16;
 
 /// Matrix–vector product `out = W · x` for a row-major weight matrix (scalar).
 ///
@@ -282,6 +296,82 @@ pub unsafe fn matmul_q8_dotprod(
             }
             *o = total;
         }
+    }
+}
+
+/// Full int8 (**W8A8**) matmul using the ARM NEON **dot-product** extension (`sdot`).
+///
+/// The aarch64 counterpart of the x86 [`matmul_q8_dotprod`] above. `vdotq_s32`
+/// (`sdot`) does 16 int8 multiply-accumulates into four `i32` lanes per instruction.
+/// Crucially, unlike x86 VNNI's `vpdpbusd`, `sdot` multiplies **signed × signed**
+/// bytes directly, so the int8 weights and activations are consumed exactly as stored:
+/// there is no `+128`/`−128` unsigned-offset trick and this kernel needs no per-group
+/// activation sums (`x_gsums`) at all. The integer accumulation is exact, so the result
+/// is **bit-identical** to the scalar [`matmul_q8`].
+///
+/// Each group is processed in 16-byte chunks accumulated in one `int32x4` vector and
+/// reduced once per group; a scalar tail handles any `group_size % 16` remainder, so —
+/// unlike the x86 path, which requires a multiple of 32 — every group size is supported.
+///
+/// `qw` must be a **single** projection's matrix shaped `[d_out, d_in]` (slice it with
+/// [`QuantizedTensor::layer`] first), and `group_size` must divide `d_in`.
+///
+/// # Safety
+/// The CPU must support the NEON `dotprod` feature. The std host verifies this with
+/// `is_aarch64_feature_detected!("dotprod")` before selecting
+/// [`Kernel::Dotprod`](crate::Kernel); any other caller must guarantee it.
+///
+/// # Panics
+/// In debug builds, if the slice lengths disagree with `d_in`/`d_out`/`group_size`.
+#[cfg(target_arch = "aarch64")]
+#[target_feature(enable = "dotprod")]
+pub unsafe fn matmul_q8_dotprod(
+    out: &mut [f32],
+    xq: &[i8],
+    x_scales: &[f32],
+    qw: &QuantizedTensor,
+    d_in: usize,
+    d_out: usize,
+) {
+    debug_assert_eq!(out.len(), d_out);
+    debug_assert_eq!(xq.len(), d_in);
+    debug_assert_eq!(qw.data.len(), d_in * d_out);
+    debug_assert_eq!(d_in % qw.group_size, 0);
+    debug_assert_eq!(qw.scales.len(), d_out * (d_in / qw.group_size));
+    debug_assert_eq!(x_scales.len(), d_in / qw.group_size);
+
+    let gs = qw.group_size;
+    let groups_per_row = d_in / gs;
+    let chunks = gs / SDOT_LANES; // whole 16-wide lanes per group
+    for (i, o) in out.iter_mut().enumerate() {
+        let row = &qw.data[i * d_in..][..d_in];
+        let mut total = 0.0f32;
+        for (g, &x_scale) in x_scales.iter().enumerate() {
+            let base = g * gs;
+            let wg = &row[base..][..gs];
+            let xg = &xq[base..][..gs];
+
+            // Per-group signed int8 dot product: 16 lanes/instruction via `sdot`.
+            let mut acc = vdupq_n_s32(0);
+            for c in 0..chunks {
+                let wc = &wg[c * SDOT_LANES..][..SDOT_LANES];
+                let xc = &xg[c * SDOT_LANES..][..SDOT_LANES];
+                // SAFETY: each load reads exactly the 16 in-bounds bytes of `wc`/`xc`;
+                // the `target_feature` contract guarantees NEON `dotprod` on this CPU.
+                let vw = unsafe { vld1q_s8(wc.as_ptr()) };
+                let vx = unsafe { vld1q_s8(xc.as_ptr()) };
+                acc = vdotq_s32(acc, vw, vx);
+            }
+            let mut ival = vaddvq_s32(acc);
+
+            // Scalar tail for the leftover < 16 columns (when 16 ∤ group_size).
+            for k in (chunks * SDOT_LANES)..gs {
+                ival += wg[k] as i32 * xg[k] as i32;
+            }
+
+            total += ival as f32 * qw.scales[i * groups_per_row + g] * x_scale;
+        }
+        *o = total;
     }
 }
 
@@ -546,7 +636,8 @@ mod tests {
     fn matmul_q8_dotprod_matches_scalar_exactly() {
         // VNNI computes the same exact integer dot product, so it must agree with the
         // scalar kernel to the bit — on a machine that actually has the instructions.
-        if !std::is_x86_feature_detected!("avx512vnni") || !std::is_x86_feature_detected!("avx512vl")
+        if !std::is_x86_feature_detected!("avx512vnni")
+            || !std::is_x86_feature_detected!("avx512vl")
         {
             std::eprintln!("skipping: CPU lacks AVX-512 VNNI");
             return;
@@ -556,7 +647,9 @@ mod tests {
         let data: Vec<i8> = (0..d_in * d_out)
             .map(|i| (((i * 37) % 255) as i32 - 127) as i8)
             .collect();
-        let scales: Vec<f32> = (0..d_out * (d_in / gs)).map(|i| 0.01 + i as f32 * 0.003).collect();
+        let scales: Vec<f32> = (0..d_out * (d_in / gs))
+            .map(|i| 0.01 + i as f32 * 0.003)
+            .collect();
         let qw = QuantizedTensor {
             data: &data,
             scales: &scales,
@@ -571,6 +664,41 @@ mod tests {
         // SAFETY: guarded by the feature check above.
         unsafe { matmul_q8_dotprod(&mut vnni, &xq, &xs, &xg, &qw, d_in, d_out) };
         assert_eq!(scalar, vnni);
+    }
+
+    #[test]
+    #[cfg(target_arch = "aarch64")]
+    fn matmul_q8_dotprod_matches_scalar_exactly() {
+        // ARM `sdot` computes the same exact signed integer dot product, so it must
+        // agree with the scalar kernel to the bit — on a machine that has the extension.
+        if !std::arch::is_aarch64_feature_detected!("dotprod") {
+            std::eprintln!("skipping: CPU lacks the NEON dotprod extension");
+            return;
+        }
+        // group_size 40 = 16 + 16 + 8, so every group runs two full `sdot` lanes plus
+        // an 8-wide scalar tail — exercising both code paths. 80 columns → 2 groups,
+        // 5 rows.
+        let (d_in, d_out, gs) = (80usize, 5usize, 40usize);
+        let data: Vec<i8> = (0..d_in * d_out)
+            .map(|i| (((i * 37) % 255) as i32 - 127) as i8)
+            .collect();
+        let scales: Vec<f32> = (0..d_out * (d_in / gs))
+            .map(|i| 0.01 + i as f32 * 0.003)
+            .collect();
+        let qw = QuantizedTensor {
+            data: &data,
+            scales: &scales,
+            group_size: gs,
+        };
+        let x: Vec<f32> = (0..d_in).map(|i| (i as f32 * 0.21).sin() * 1.7).collect();
+        let (xq, xs, _xg) = quant_act(&x, gs);
+
+        let mut scalar = vec![0.0f32; d_out];
+        let mut sdot = vec![0.0f32; d_out];
+        matmul_q8(&mut scalar, &xq, &xs, &qw, d_in, d_out);
+        // SAFETY: guarded by the feature check above.
+        unsafe { matmul_q8_dotprod(&mut sdot, &xq, &xs, &qw, d_in, d_out) };
+        assert_eq!(scalar, sdot);
     }
 
     #[test]
