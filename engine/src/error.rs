@@ -9,8 +9,15 @@ use core::fmt;
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum EngineError {
-    /// The checkpoint header was shorter than the 28-byte config block.
+    /// The checkpoint header was shorter than its config block (28 bytes for the
+    /// legacy format, 256 for the versioned v1/v2 formats).
     HeaderTooShort,
+    /// The checkpoint carries the versioned magic but declares a format version
+    /// this engine does not support (supported: 1 and 2).
+    UnsupportedVersion {
+        /// The version field found after the magic.
+        version: i32,
+    },
     /// A config field held a value the engine cannot use (e.g. zero or
     /// non-divisible `dim`/`n_heads`).
     InvalidConfig(ConfigField),
@@ -45,18 +52,26 @@ pub enum ConfigField {
     NHeads,
     /// `n_kv_heads` was zero, or did not divide `n_heads`.
     NKvHeads,
-    /// `vocab_size` was zero.
+    /// `vocab_size` was zero (or negative in a v1/v2 header, where the sign
+    /// carries no meaning).
     VocabSize,
     /// `seq_len` was zero.
     SeqLen,
+    /// A v2 header's quantization `group_size` was non-positive, or did not divide
+    /// `dim` and `hidden_dim` (a group must never straddle a matrix row).
+    GroupSize,
 }
 
 impl fmt::Display for EngineError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             EngineError::HeaderTooShort => {
-                f.write_str("checkpoint is smaller than the 28-byte config header")
+                f.write_str("checkpoint is smaller than its config header")
             }
+            EngineError::UnsupportedVersion { version } => write!(
+                f,
+                "unsupported checkpoint format version {version} (supported: 1, 2)"
+            ),
             EngineError::InvalidConfig(field) => {
                 write!(f, "invalid model config: bad {field:?} field")
             }

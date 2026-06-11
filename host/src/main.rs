@@ -9,6 +9,7 @@
 //!   the temperature-scaled softmax), and stream the decoded text. Requires a
 //!   tokenizer.
 
+mod convert;
 mod error;
 mod loader;
 mod tokenizer;
@@ -20,10 +21,14 @@ use std::time::Instant;
 use engine::math::{argmax, maxf};
 use engine::memory::{arena_floats, max_proj_d_in, MemoryBudget};
 use engine::quantize::{quantize_weights, quantized_scale_count, quantized_weight_count};
-use engine::{forward, Arena, Config, Kernel, ModelWeights, QuantScratch, RunState};
+use engine::{
+    forward, Arena, Config, Kernel, ModelFormat, ModelWeights, QuantScratch, QuantizedWeights,
+    RunState,
+};
 use rand::rngs::StdRng;
 use rand::{RngExt, SeedableRng};
 
+use crate::convert::Target;
 use crate::error::HostError;
 use crate::loader::Model;
 use crate::tokenizer::{Vocab, BOS_ID};
@@ -58,10 +63,17 @@ OPTIONS:
         --dotprod             Use the hardware int8 dot-product kernel for --quantize
                               (x86 AVX-512 VNNI or ARM NEON sdot; falls back to SIMD
                               if the CPU has neither)
+        --convert <PATH>      Convert the checkpoint to another format, write it to
+                              PATH, and exit (no generation)
+        --to <v1|v2>          Conversion target (default v2): v1 = fp32 with the
+                              256-byte versioned header; v2 = int8-quantized Q8_0,
+                              runq.c's format (uses --group-size)
     -h, --help                Print this help and exit
 
-With no --prompt, tiny-infer prints the model config, validates the files, and
-reports the memory budget. With --prompt (and a tokenizer) it generates text.";
+Reads all three llama2.c checkpoint formats: legacy (v0), v1 (fp32), and v2
+(pre-quantized int8 — implies the int8 path; -q is redundant). With no --prompt,
+tiny-infer prints the model config, validates the files, and reports the memory
+budget. With --prompt (and a tokenizer) it generates text.";
 
 fn main() -> ExitCode {
     match run() {
@@ -86,9 +98,26 @@ fn run() -> Result<(), HostError> {
     let model_path = args
         .model
         .ok_or_else(|| HostError::Usage("no model file given".into()))?;
+    if args.to.is_some() && args.convert.is_none() {
+        return Err(HostError::Usage("`--to` requires `--convert <PATH>`".into()));
+    }
+    if args.convert.is_some() && args.prompt.is_some() {
+        return Err(HostError::Usage(
+            "`--convert` writes a checkpoint and exits; it cannot be combined with --prompt".into(),
+        ));
+    }
 
     let model = Model::load(&model_path)?;
     let config = model.config; // Copy, so generation can outlive the file buffer.
+
+    // Conversion mode: write the requested format and exit.
+    if let Some(out_path) = args.convert.as_deref() {
+        let target = args.to.unwrap_or(Target::V2);
+        if target == Target::V2 {
+            check_group_size(&config, args.group_size)?;
+        }
+        return convert::convert(&model, out_path.as_ref(), target, args.group_size);
+    }
 
     // Generation mode: requires a prompt and a tokenizer.
     if let Some(prompt) = args.prompt.as_deref() {
@@ -98,6 +127,39 @@ fn run() -> Result<(), HostError> {
         let vocab = Vocab::load(&tok_path, config.vocab_size)?;
         let sampler = Sampler::new(config.vocab_size, args.temperature, args.topp, args.seed);
         let kernel = select_kernel(args.scalar, args.dotprod);
+
+        // A v2 checkpoint is already int8: de-interleave its tensors into the
+        // engine layout and go straight to the Q8 path — no quantization work,
+        // and no fp32 weights ever resident.
+        if let ModelFormat::V2 { group_size } = model.format {
+            if args.quantize {
+                eprintln!(
+                    "[--quantize: checkpoint is already int8 (v2, group_size {group_size}); \
+                     flag ignored]"
+                );
+            }
+            let bufs = model.unpack_q8()?;
+            drop(model); // free the raw file; the unpacked buffers are all we need
+            let qw = QuantizedWeights::new(
+                &bufs.data,
+                &bufs.scales,
+                &bufs.rms_att,
+                &bufs.rms_ffn,
+                &bufs.rms_final,
+                bufs.group_size,
+                &config,
+            )
+            .map_err(|e| HostError::engine(&model_path, e))?;
+            return generate(
+                &config,
+                &ModelWeights::Q8(qw),
+                &vocab,
+                prompt,
+                args.steps,
+                sampler,
+                kernel,
+            );
+        }
 
         if args.quantize {
             let gs = args.group_size;
@@ -145,7 +207,10 @@ fn run() -> Result<(), HostError> {
     }
 
     // Report mode: validate the weight layout, then print the model summary.
-    let _ = model.weights()?;
+    // (v2 has no fp32 view; its layout was already size-validated at load.)
+    if !matches!(model.format, ModelFormat::V2 { .. }) {
+        let _ = model.weights()?;
+    }
     report_model(&model_path, &model);
     if let Some(tok_path) = args.tokenizer {
         let vocab = Vocab::load(&tok_path, model.config.vocab_size)?;
@@ -347,6 +412,7 @@ fn report_model(path: &str, model: &Model) {
     let c = &model.config;
     println!("Model: {path}");
     println!("  status         OK (file size matches config)");
+    println!("  format         {}", format_label(model.format));
     println!("  dim            {}", c.dim);
     println!("  hidden_dim     {}", c.hidden_dim);
     println!("  n_layers       {}", c.n_layers);
@@ -415,6 +481,17 @@ fn report_memory(model: &Model) {
         "  peak RAM       {:>10}  (weights + arena)",
         human_bytes(model.weight_bytes() + budget.total_bytes())
     );
+}
+
+/// Human-readable name of a checkpoint format, for the report.
+fn format_label(f: ModelFormat) -> String {
+    match f {
+        ModelFormat::Legacy => "legacy (v0), fp32 weights".into(),
+        ModelFormat::V1 => "v1, fp32 weights".into(),
+        ModelFormat::V2 { group_size } => {
+            format!("v2, int8 weights (group_size {group_size})")
+        }
+    }
 }
 
 /// Pick the matmul kernel from the flags, with a graceful fallback when `--dotprod`
@@ -534,6 +611,8 @@ struct Args {
     group_size: usize,
     scalar: bool,
     dotprod: bool,
+    convert: Option<String>,
+    to: Option<Target>,
     help: bool,
 }
 
@@ -550,6 +629,8 @@ impl Args {
         let mut group_size = 32usize;
         let mut scalar = false;
         let mut dotprod = false;
+        let mut convert = None;
+        let mut to = None;
         let mut help = false;
         let mut positionals = Vec::new();
 
@@ -572,6 +653,8 @@ impl Args {
                 "--group-size" => {
                     group_size = parse_usize(&expect_value(&mut it, &arg)?, &arg)?
                 }
+                "--convert" => convert = Some(expect_value(&mut it, &arg)?),
+                "--to" => to = Some(parse_target(&expect_value(&mut it, &arg)?)?),
                 s if s.starts_with("--model=") => model = Some(after_eq(s)),
                 s if s.starts_with("--tokenizer=") => tokenizer = Some(after_eq(s)),
                 s if s.starts_with("--prompt=") => prompt = Some(after_eq(s)),
@@ -586,6 +669,8 @@ impl Args {
                 s if s.starts_with("--group-size=") => {
                     group_size = parse_usize(&after_eq(s), "--group-size")?
                 }
+                s if s.starts_with("--convert=") => convert = Some(after_eq(s)),
+                s if s.starts_with("--to=") => to = Some(parse_target(&after_eq(s))?),
                 s if s.starts_with('-') && s != "-" => {
                     return Err(HostError::Usage(format!("unknown option `{s}`")));
                 }
@@ -617,8 +702,21 @@ impl Args {
             group_size,
             scalar,
             dotprod,
+            convert,
+            to,
             help,
         })
+    }
+}
+
+/// Parse a `--to` conversion target.
+fn parse_target(s: &str) -> Result<Target, HostError> {
+    match s {
+        "v1" => Ok(Target::V1),
+        "v2" => Ok(Target::V2),
+        _ => Err(HostError::Usage(format!(
+            "`--to` expects `v1` or `v2`, got `{s}`"
+        ))),
     }
 }
 
@@ -743,6 +841,27 @@ mod tests {
         let b = parse(&["m.bin", "--quantize", "--group-size=96"]).unwrap();
         assert!(b.quantize);
         assert_eq!(b.group_size, 96);
+    }
+
+    #[test]
+    fn convert_flags_parse() {
+        let def = parse(&["m.bin"]).unwrap();
+        assert!(def.convert.is_none());
+        assert!(def.to.is_none());
+
+        let a = parse(&["m.bin", "--convert", "out.bin", "--to", "v1"]).unwrap();
+        assert_eq!(a.convert.as_deref(), Some("out.bin"));
+        assert_eq!(a.to, Some(Target::V1));
+
+        let b = parse(&["m.bin", "--convert=out.bin", "--to=v2"]).unwrap();
+        assert_eq!(b.convert.as_deref(), Some("out.bin"));
+        assert_eq!(b.to, Some(Target::V2));
+
+        // Anything but v1/v2 is a usage error.
+        assert!(matches!(
+            parse(&["m.bin", "--convert", "o.bin", "--to", "v3"]),
+            Err(HostError::Usage(_))
+        ));
     }
 
     fn stories_like_config() -> Config {

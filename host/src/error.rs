@@ -16,6 +16,9 @@ pub enum HostError {
     NotF32Aligned { path: PathBuf, len: u64 },
     /// An error bubbled up from the engine core (bad header, size mismatch, …).
     Engine { path: PathBuf, source: EngineError },
+    /// A checkpoint whose (valid) format does not fit the requested operation,
+    /// e.g. asking for an fp32 view of an int8 (v2) file.
+    Format { path: PathBuf, msg: String },
     /// A malformed tokenizer file.
     Tokenizer(String),
 }
@@ -52,6 +55,9 @@ impl fmt::Display for HostError {
             ),
             HostError::Engine { path, source } => {
                 write!(f, "{}: {source}", path.display())
+            }
+            HostError::Format { path, msg } => {
+                write!(f, "{}: {msg}", path.display())
             }
             HostError::Tokenizer(msg) => write!(f, "tokenizer: {msg}"),
         }

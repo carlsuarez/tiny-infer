@@ -7,9 +7,13 @@
 //!
 //! [`Vocab::encode`] and [`Vocab::decode`] implement the same SentencePiece-style
 //! BPE as run.c, so prompts tokenize identically and generation can be checked for
-//! parity. In this checkpoint's vocabulary the SentencePiece space marker has been
-//! exported as an ASCII space (`0x20`), ids `3..=258` are the byte-fallback tokens
-//! `<0x00>`..`<0xFF>`, and id `1` (`<s>`) is BOS.
+//! parity. This works for any tokenizer exported by llama2.c's `tokenizer.py` —
+//! the stock 32 000-token Llama vocabulary and custom-trained ones alike: the
+//! export replaces the SentencePiece space marker `▁` with an ASCII space
+//! (`0x20`), id `1` (`<s>`) is BOS, and — when the tokenizer was trained with
+//! byte fallback — ids `3..=258` are the byte tokens `<0x00>`..`<0xFF>`. Encoding
+//! never assumes that block exists: unknown codepoints use the byte tokens only
+//! after verifying they are present, and map to `<unk>` (id 0) otherwise.
 
 use std::collections::HashMap;
 use std::path::Path;
@@ -19,13 +23,18 @@ use crate::error::HostError;
 /// BOS token id (`<s>`). Also the sequence delimiter that decoding/generation stop on.
 pub const BOS_ID: usize = 1;
 
-/// Byte-fallback tokens occupy ids `3..=258`, so raw byte `b` maps to id `b + 3`.
+/// The `<unk>` token id, emitted for codepoints the vocabulary cannot represent.
+const UNK_ID: usize = 0;
+
+/// Byte-fallback tokens conventionally occupy ids `3..=258`, so raw byte `b` maps
+/// to id `b + 3`. [`Vocab::encode`] verifies the entry really is a `<0xNN>` token
+/// before relying on this.
 const BYTE_TOKEN_OFFSET: usize = 3;
 
 /// One vocabulary entry: its merge score and raw byte string.
 #[derive(Debug, Clone)]
 pub struct TokenEntry {
-    /// Merge priority used by the BPE encoder (later milestone).
+    /// Merge priority used by the BPE encoder.
     pub score: f32,
     /// Raw bytes of the token piece (not necessarily valid UTF-8).
     pub bytes: Vec<u8>,
@@ -67,9 +76,26 @@ pub struct Vocab {
     pub max_token_length: usize,
     /// All `vocab_size` entries, indexed by token id.
     pub tokens: Vec<TokenEntry>,
+    /// Exact piece-bytes -> id lookup, built once at construction. On duplicate
+    /// pieces the lowest id wins, which is deterministic (the merge scores are
+    /// what actually drive encoding output).
+    ids: HashMap<Vec<u8>, usize>,
 }
 
 impl Vocab {
+    /// Build a vocabulary from its entries, indexing the pieces for encoding.
+    fn new(max_token_length: usize, tokens: Vec<TokenEntry>) -> Vocab {
+        let mut ids: HashMap<Vec<u8>, usize> = HashMap::with_capacity(tokens.len());
+        for (id, tok) in tokens.iter().enumerate() {
+            ids.entry(tok.bytes.clone()).or_insert(id);
+        }
+        Vocab {
+            max_token_length,
+            tokens,
+            ids,
+        }
+    }
+
     /// Number of tokens in the vocabulary.
     pub fn len(&self) -> usize {
         self.tokens.len()
@@ -116,10 +142,7 @@ impl Vocab {
             )));
         }
 
-        Ok(Vocab {
-            max_token_length: max_token_length as usize,
-            tokens,
-        })
+        Ok(Vocab::new(max_token_length as usize, tokens))
     }
 
     /// Encode `text` into token ids using SentencePiece-style greedy BPE.
@@ -128,37 +151,39 @@ impl Vocab {
     /// 1. optionally emit BOS (`<s>`);
     /// 2. emit a "dummy prefix" space token before non-empty text;
     /// 3. map each UTF-8 codepoint to its token, or fall back to raw byte tokens
-    ///    (`byte + 3`) when the codepoint isn't a vocabulary entry;
+    ///    (`byte + 3`) when the codepoint isn't a vocabulary entry — or to `<unk>`
+    ///    when the vocabulary has no byte-fallback tokens either;
     /// 4. repeatedly merge the adjacent pair with the highest merge score until no
     ///    adjacent pair forms a known token.
     pub fn encode(&self, text: &str, bos: bool) -> Vec<usize> {
-        // Exact piece-bytes -> id map. On duplicate pieces the lowest id wins,
-        // which is deterministic (the merge scores are what actually drive output).
-        let mut lookup: HashMap<&[u8], usize> = HashMap::with_capacity(self.tokens.len());
-        for (id, tok) in self.tokens.iter().enumerate() {
-            lookup.entry(tok.bytes.as_slice()).or_insert(id);
-        }
-
         let mut tokens: Vec<usize> = Vec::new();
         if bos {
             tokens.push(BOS_ID);
         }
         // Dummy prefix: a leading space token before the real text.
         if !text.is_empty() {
-            if let Some(&space) = lookup.get(b" ".as_slice()) {
+            if let Some(&space) = self.ids.get(b" ".as_slice()) {
                 tokens.push(space);
             }
         }
 
-        // First pass: one token per codepoint, with raw-byte fallback.
+        // First pass: one token per codepoint, with raw-byte fallback. run.c
+        // assumes ids 3..=258 are the byte tokens; verify before indexing so a
+        // vocabulary trained without byte fallback degrades to <unk> instead of
+        // panicking out of bounds.
         let mut buf = [0u8; 4];
         for ch in text.chars() {
             let piece = ch.encode_utf8(&mut buf).as_bytes();
-            if let Some(&id) = lookup.get(piece) {
+            if let Some(&id) = self.ids.get(piece) {
                 tokens.push(id);
             } else {
                 for &b in piece {
-                    tokens.push(b as usize + BYTE_TOKEN_OFFSET);
+                    let id = b as usize + BYTE_TOKEN_OFFSET;
+                    if self.tokens.get(id).is_some_and(TokenEntry::is_byte_fallback) {
+                        tokens.push(id);
+                    } else {
+                        tokens.push(UNK_ID);
+                    }
                 }
             }
         }
@@ -171,7 +196,7 @@ impl Vocab {
                 pair.clear();
                 pair.extend_from_slice(&self.tokens[tokens[i]].bytes);
                 pair.extend_from_slice(&self.tokens[tokens[i + 1]].bytes);
-                if let Some(&id) = lookup.get(pair.as_slice()) {
+                if let Some(&id) = self.ids.get(pair.as_slice()) {
                     let score = self.tokens[id].score;
                     if best.is_none_or(|(b, _, _)| score > b) {
                         best = Some((score, id, i));
@@ -334,10 +359,11 @@ mod tests {
 
     /// Small vocab with a real merge: `a` + `b` -> `ab` (high score) and a leading
     /// space token, plus `" a"` to check that the higher-scoring merge wins.
+    /// Deliberately has no `<0xNN>` byte-fallback block.
     fn ab_vocab() -> Vocab {
-        Vocab {
-            max_token_length: 5,
-            tokens: vec![
+        Vocab::new(
+            5,
+            vec![
                 entry(0.0, b"<unk>"),    // 0
                 entry(0.0, b"\n<s>\n"),  // 1 BOS
                 entry(0.0, b"\n</s>\n"), // 2 EOS
@@ -347,7 +373,7 @@ mod tests {
                 entry(-3.0, b" "),       // 6  space
                 entry(1.0, b" a"),       // 7  lower-scoring merge
             ],
-        }
+        )
     }
 
     /// Vocab with the three specials followed by all 256 byte-fallback tokens, so
@@ -361,10 +387,7 @@ mod tests {
         for n in 0u32..256 {
             tokens.push(entry(0.0, format!("<0x{n:02X}>").as_bytes()));
         }
-        Vocab {
-            max_token_length: 6,
-            tokens,
-        }
+        Vocab::new(6, tokens)
     }
 
     #[test]
@@ -393,6 +416,17 @@ mod tests {
         assert_eq!(v.encode("\n", false), vec![0x0A + 3]);
         // Two bytes, no possible merge in this vocab.
         assert_eq!(v.encode("\n\n", false), vec![0x0A + 3, 0x0A + 3]);
+    }
+
+    #[test]
+    fn encode_maps_unknown_codepoints_to_unk_without_byte_tokens() {
+        // ab_vocab has no <0xNN> block: byte fallback would index id 13 (for
+        // '\n') or past the end entirely (for 'é'), so both must become <unk>.
+        let v = ab_vocab();
+        // Dummy-prefix space (6), then one <unk> for the unknown '\n'.
+        assert_eq!(v.encode("\n", false), vec![6, UNK_ID]);
+        // 'é' is two UTF-8 bytes -> two <unk>s, and no out-of-bounds panic.
+        assert_eq!(v.encode("é", false), vec![6, UNK_ID, UNK_ID]);
     }
 
     #[test]

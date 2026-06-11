@@ -1,40 +1,49 @@
 //! Zero-copy views into a checkpoint's `f32` weight region.
 //!
-//! After the [`Config`] header, a legacy llama2.c checkpoint stores every weight
+//! After the [`Config`] header, an fp32 llama2.c checkpoint stores every weight
 //! tensor as raw little-endian `f32`, back to back, in a fixed order. We never
 //! copy or reshape them: [`Weights`] holds borrowed sub-slices that point straight
 //! into the (host-owned, memory-mapped or read) file buffer.
 //!
-//! The on-disk order, with `att_dim = n_heads * head_size` and `kv_dim`:
+//! The two fp32 formats store the **same tensors in different orders**
+//! ([`Weights::new`] parses legacy, [`Weights::new_v1`] parses v1); the int8 v2
+//! format is handled by [`crate::quantize`] instead. With
+//! `att_dim = n_heads * head_size` and `kv_dim`:
 //!
-//! | # | tensor              | length (`f32`)               |
-//! |---|---------------------|------------------------------|
-//! | 1 | `token_embedding`   | `vocab * dim`                |
-//! | 2 | `rms_att`           | `n_layers * dim`             |
-//! | 3 | `wq`                | `n_layers * dim * att_dim`   |
-//! | 4 | `wk`                | `n_layers * dim * kv_dim`    |
-//! | 5 | `wv`                | `n_layers * dim * kv_dim`    |
-//! | 6 | `wo`                | `n_layers * att_dim * dim`   |
-//! | 7 | `rms_ffn`           | `n_layers * dim`             |
-//! | 8 | `w1`                | `n_layers * hidden * dim`    |
-//! | 9 | `w2`                | `n_layers * dim * hidden`    |
-//! |10 | `w3`                | `n_layers * hidden * dim`    |
-//! |11 | `rms_final`         | `dim`                        |
-//! |12 | `freq_cis_real`     | `seq_len * head_size/2` *(skipped — RoPE is computed live)* |
-//! |13 | `freq_cis_imag`     | `seq_len * head_size/2` *(skipped)* |
-//! |14 | `wcls`              | `vocab * dim` *(only if not shared)* |
+//! | legacy (v0)         | v1                  | length (`f32`)               |
+//! |---------------------|---------------------|------------------------------|
+//! | `token_embedding`   | `rms_att`           | (see own column)             |
+//! | `rms_att`           | `rms_ffn`           | `n_layers * dim`             |
+//! | `wq`                | `rms_final`         | `dim`                        |
+//! | `wk`                | `token_embedding`   | `vocab * dim`                |
+//! | `wv`                | `wq`                | `n_layers * dim * att_dim`   |
+//! | `wo`                | `wk`                | `n_layers * dim * kv_dim`    |
+//! | `rms_ffn`           | `wv`                | `n_layers * dim * kv_dim`    |
+//! | `w1`                | `wo`                | `n_layers * att_dim * dim`   |
+//! | `w2`                | `w1`                | `n_layers * hidden * dim`    |
+//! | `w3`                | `w2`                | `n_layers * dim * hidden`    |
+//! | `rms_final`         | `w3`                | `n_layers * hidden * dim`    |
+//! | `freq_cis_real`/`imag` *(legacy only, skipped — RoPE is computed live)* | — | `seq_len * head_size/2` × 2 |
+//! | `wcls` *(only if not shared)* | `wcls` *(ditto)* | `vocab * dim`     |
 
-use crate::config::{Config, HEADER_BYTES};
+use crate::config::{Config, ModelFormat};
 use crate::error::EngineError;
 
-/// Number of `f32` elements the checkpoint stores after the header for a given
-/// config — including the two skipped `freq_cis` tables, and the separate
-/// classifier matrix only when weights are not shared.
+/// Number of `f32` elements a **legacy** checkpoint stores after the header —
+/// including the two skipped `freq_cis` tables, and the separate classifier
+/// matrix only when weights are not shared.
 pub fn weight_floats(c: &Config) -> usize {
+    let freq = c.seq_len * (c.head_size() / 2);
+    // Same tensors as v1 plus the two legacy-only freq_cis tables.
+    weight_floats_v1(c) + 2 * freq
+}
+
+/// Number of `f32` elements a **v1** checkpoint stores after its 256-byte header:
+/// every legacy tensor except the `freq_cis` tables (v1 dropped them).
+pub fn weight_floats_v1(c: &Config) -> usize {
     let att_dim = c.n_heads * c.head_size();
     let kv_dim = c.kv_dim();
     let l = c.n_layers;
-    let freq = c.seq_len * (c.head_size() / 2);
 
     let mut n = 0;
     n += c.vocab_size * c.dim; // token_embedding
@@ -48,18 +57,30 @@ pub fn weight_floats(c: &Config) -> usize {
     n += l * c.dim * c.hidden_dim; // w2
     n += l * c.hidden_dim * c.dim; // w3
     n += c.dim; // rms_final
-    n += freq; // freq_cis_real (skipped at runtime)
-    n += freq; // freq_cis_imag (skipped at runtime)
     if !c.shared_weights {
         n += c.vocab_size * c.dim; // wcls
     }
     n
 }
 
-/// Total on-disk size of a checkpoint with this config, in bytes:
-/// the 28-byte header plus every weight `f32`.
-pub fn expected_file_bytes(c: &Config) -> usize {
-    HEADER_BYTES + weight_floats(c) * core::mem::size_of::<f32>()
+/// Total on-disk size of a checkpoint with this config and format, in bytes:
+/// the format's header plus its weight payload.
+///
+/// For [`ModelFormat::V2`] the payload is the fp32 RMSNorm gains followed by the
+/// int8 weights and their `f32` scales (see [`crate::quantize`]).
+pub fn expected_file_bytes(c: &Config, format: ModelFormat) -> usize {
+    const F32: usize = core::mem::size_of::<f32>();
+    format.header_bytes()
+        + match format {
+            ModelFormat::Legacy => weight_floats(c) * F32,
+            ModelFormat::V1 => weight_floats_v1(c) * F32,
+            ModelFormat::V2 { group_size } => {
+                let norms = 2 * c.n_layers * c.dim + c.dim; // rms_att + rms_ffn + rms_final
+                let data = crate::quantize::quantized_weight_count(c);
+                let scales = crate::quantize::quantized_scale_count(c, group_size);
+                norms * F32 + data + scales * F32
+            }
+        }
 }
 
 /// Borrowed, zero-copy views of every weight tensor.
@@ -158,6 +179,65 @@ impl<'a> Weights<'a> {
             wcls,
         })
     }
+
+    /// Carve the weight tensors out of a **v1** checkpoint's `f32` region.
+    ///
+    /// Same contract as [`Weights::new`], but in the v1 on-disk order: the three
+    /// RMSNorm gain groups first, then the embedding and the seven projections,
+    /// with no `freq_cis` tables. The resulting view is indistinguishable from a
+    /// legacy one — only the carving order differs.
+    pub fn new_v1(floats: &'a [f32], c: &Config) -> Result<Weights<'a>, EngineError> {
+        let needed = weight_floats_v1(c);
+        if floats.len() < needed {
+            return Err(EngineError::SizeMismatch {
+                expected: needed * core::mem::size_of::<f32>(),
+                actual: core::mem::size_of_val(floats),
+            });
+        }
+
+        let att_dim = c.n_heads * c.head_size();
+        let kv_dim = c.kv_dim();
+        let l = c.n_layers;
+
+        let mut rest = floats;
+        let mut take = |n: usize| -> &'a [f32] {
+            let (head, tail) = rest.split_at(n);
+            rest = tail;
+            head
+        };
+
+        let rms_att = take(l * c.dim);
+        let rms_ffn = take(l * c.dim);
+        let rms_final = take(c.dim);
+        let token_embedding = take(c.vocab_size * c.dim);
+        let wq = take(l * c.dim * att_dim);
+        let wk = take(l * c.dim * kv_dim);
+        let wv = take(l * c.dim * kv_dim);
+        let wo = take(l * att_dim * c.dim);
+        let w1 = take(l * c.hidden_dim * c.dim);
+        let w2 = take(l * c.dim * c.hidden_dim);
+        let w3 = take(l * c.hidden_dim * c.dim);
+        let wcls = if c.shared_weights {
+            token_embedding
+        } else {
+            take(c.vocab_size * c.dim)
+        };
+
+        Ok(Weights {
+            token_embedding,
+            rms_att,
+            wq,
+            wk,
+            wv,
+            wo,
+            rms_ffn,
+            w1,
+            w2,
+            w3,
+            rms_final,
+            wcls,
+        })
+    }
 }
 
 #[cfg(test)]
@@ -186,7 +266,74 @@ mod tests {
         // shared -> no wcls
         let expect = 20 + 8 + 32 + 16 + 16 + 32 + 8 + 64 + 64 + 64 + 4 + 12;
         assert_eq!(weight_floats(&c), expect);
-        assert_eq!(expected_file_bytes(&c), HEADER_BYTES + expect * 4);
+        assert_eq!(
+            expected_file_bytes(&c, ModelFormat::Legacy),
+            crate::config::HEADER_BYTES + expect * 4
+        );
+        // v1 drops the two freq_cis tables (12 floats here) and pays the bigger header.
+        assert_eq!(weight_floats_v1(&c), expect - 12);
+        assert_eq!(
+            expected_file_bytes(&c, ModelFormat::V1),
+            crate::config::VERSIONED_HEADER_BYTES + (expect - 12) * 4
+        );
+    }
+
+    #[test]
+    fn expected_v2_bytes_counts_norms_data_and_scales() {
+        let c = tiny_config(true);
+        let gs = 2;
+        // fp32 norms: rms_att 8 + rms_ffn 8 + rms_final 4 = 20 floats.
+        // int8 data: every quantized weight, 1 byte each; scales: one f32 per group.
+        let data = crate::quantize::quantized_weight_count(&c);
+        let expect =
+            crate::config::VERSIONED_HEADER_BYTES + 20 * 4 + data + (data / gs) * 4;
+        assert_eq!(
+            expected_file_bytes(&c, ModelFormat::V2 { group_size: gs }),
+            expect
+        );
+    }
+
+    #[test]
+    fn v1_views_carve_the_same_tensors_at_their_v1_offsets() {
+        // Fill the buffer with its own indices so each slice's first element
+        // reveals the offset it was carved from — proving the v1 order.
+        let c = tiny_config(true);
+        let buf: std::vec::Vec<f32> = (0..weight_floats_v1(&c)).map(|i| i as f32).collect();
+        let w = Weights::new_v1(&buf, &c).unwrap();
+
+        // v1 order: rms_att(8) | rms_ffn(8) | rms_final(4) | emb(20) | wq(32) | ...
+        assert_eq!(w.rms_att[0], 0.0);
+        assert_eq!(w.rms_ffn[0], 8.0);
+        assert_eq!(w.rms_final[0], 16.0);
+        assert_eq!(w.token_embedding[0], 20.0);
+        assert_eq!(w.wq[0], 40.0);
+        assert_eq!(w.wk[0], 72.0);
+        assert_eq!(w.wv[0], 88.0);
+        assert_eq!(w.wo[0], 104.0);
+        assert_eq!(w.w1[0], 136.0);
+        assert_eq!(w.w2[0], 200.0);
+        assert_eq!(w.w3[0], 264.0);
+        // Shared: wcls aliases the embedding.
+        assert_eq!(w.wcls.as_ptr(), w.token_embedding.as_ptr());
+    }
+
+    #[test]
+    fn v1_unshared_wcls_is_the_tail() {
+        let c = tiny_config(false);
+        let buf: std::vec::Vec<f32> = (0..weight_floats_v1(&c)).map(|i| i as f32).collect();
+        let w = Weights::new_v1(&buf, &c).unwrap();
+        assert_eq!(w.wcls.len(), c.vocab_size * c.dim);
+        assert_eq!(w.wcls[0], (weight_floats_v1(&c) - c.vocab_size * c.dim) as f32);
+    }
+
+    #[test]
+    fn v1_short_slice_is_rejected() {
+        let c = tiny_config(true);
+        let buf = alloc_floats(weight_floats_v1(&c) - 1);
+        assert!(matches!(
+            Weights::new_v1(&buf, &c),
+            Err(EngineError::SizeMismatch { .. })
+        ));
     }
 
     #[test]

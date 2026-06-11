@@ -238,6 +238,44 @@ pub fn quantized_scale_count(c: &Config, group_size: usize) -> usize {
     quantized_weight_count(c) / group_size
 }
 
+/// The sizes (in weights) of the quantized tensors as a **v2 checkpoint** stores
+/// them, in file order.
+///
+/// A v2 file (llama2.c `runq.c`'s format) serializes each tensor as its int8 data
+/// immediately followed by its `f32` scales — and, unlike [`quantize_weights`]'
+/// two flat buffers, every *layer* of a projection is its own tensor. The order is
+/// the embedding, then for each projection all `n_layers` layer matrices
+/// (`wq` × L, `wk` × L, `wv` × L, `wo` × L, `w1` × L, `w2` × L, `w3` × L), then the
+/// classifier when weights are not shared. The host walks this sequence to
+/// de-interleave the file into the flat layout [`QuantizedWeights::new`] expects;
+/// the per-tensor concatenation of data (and of scales) in this order is exactly
+/// that flat layout. The sizes sum to [`quantized_weight_count`].
+pub fn v2_tensor_sizes(c: &Config) -> impl Iterator<Item = usize> {
+    let att_dim = c.n_heads * c.head_size();
+    let kv_dim = c.kv_dim();
+    // One layer of each projection, in v2 file order.
+    let per_layer: [usize; 7] = [
+        c.dim * att_dim,      // wq
+        c.dim * kv_dim,       // wk
+        c.dim * kv_dim,       // wv
+        att_dim * c.dim,      // wo
+        c.hidden_dim * c.dim, // w1
+        c.dim * c.hidden_dim, // w2
+        c.hidden_dim * c.dim, // w3
+    ];
+    let emb = c.vocab_size * c.dim;
+    let n_layers = c.n_layers;
+    let wcls = (!c.shared_weights).then_some(emb);
+
+    core::iter::once(emb)
+        .chain(
+            per_layer
+                .into_iter()
+                .flat_map(move |n| core::iter::repeat_n(n, n_layers)),
+        )
+        .chain(wcls)
+}
+
 /// Quantize the matmul matrices of `fp32` into `data` + `scales`.
 ///
 /// Fills the caller-provided buffers in storage order — `token_embedding`, then
@@ -453,8 +491,14 @@ mod tests {
         assert_eq!(qi, qa);
         assert_eq!(si, sa);
         // gsums[g] is the exact integer sum of that group's quantized values.
-        assert_eq!(gsums[0], qa[..4].iter().map(|&v| v as i32).sum::<i32>() as f32);
-        assert_eq!(gsums[1], qa[4..].iter().map(|&v| v as i32).sum::<i32>() as f32);
+        assert_eq!(
+            gsums[0],
+            qa[..4].iter().map(|&v| v as i32).sum::<i32>() as f32
+        );
+        assert_eq!(
+            gsums[1],
+            qa[4..].iter().map(|&v| v as i32).sum::<i32>() as f32
+        );
     }
 
     #[test]
@@ -531,6 +575,23 @@ mod tests {
         // The classifier reuses the exact same int8 table as the embedding.
         assert_eq!(qw.wcls.data.as_ptr(), qw.token_embedding.data.as_ptr());
         assert_eq!(qw.token_embedding.data.len(), c.vocab_size * c.dim);
+    }
+
+    #[test]
+    fn v2_tensor_sizes_sum_to_the_quantized_weight_count() {
+        for shared in [true, false] {
+            let c = tiny_config(shared);
+            let sizes: Vec<usize> = v2_tensor_sizes(&c).collect();
+            // emb + 7 projections × n_layers (+ wcls when unshared).
+            let expect_count = 1 + 7 * c.n_layers + usize::from(!shared);
+            assert_eq!(sizes.len(), expect_count);
+            assert_eq!(sizes.iter().sum::<usize>(), quantized_weight_count(&c));
+            // First is the embedding; the unshared classifier is the same size last.
+            assert_eq!(sizes[0], c.vocab_size * c.dim);
+            if !shared {
+                assert_eq!(*sizes.last().unwrap(), c.vocab_size * c.dim);
+            }
+        }
     }
 
     #[test]

@@ -39,9 +39,9 @@ identical to fp32.
 
 The host quantizes the fp32 checkpoint in memory and then **frees it**, so
 steady-state weight memory on stories15M drops from ~58 MiB to ~17 MiB (generation RSS
-~66 → ~21 MiB). Honest caveat: peak RSS is briefly *higher* during quantizing (the fp32
-file and int8 buffers are both resident) — a pre-quantized on-disk format would avoid
-that.
+~66 → ~21 MiB). Peak RSS is briefly *higher* during quantizing (the fp32 file and int8
+buffers are both resident); converting the checkpoint to the pre-quantized **v2**
+format once (`--convert`, below) avoids that entirely — no fp32 weights ever load.
 
 The int8 matmul is **W8A8** (full int8): each matmul quantizes its activation to int8
 on the fly ([`quantize_activation`]), accumulates the dot product in `i32`, then applies
@@ -84,6 +84,27 @@ across all kernels. (The ARM `sdot` kernel mirrors the VNNI path and is bit-exac
 construction; throughput is unbenchmarked here, as the dev machine is x86-64 only.)
 
 [`quantize_activation`]: engine/src/quantize.rs
+
+**Checkpoint formats — legacy, v1, and v2 (`--convert`).** All three llama2.c
+export formats load transparently (the header is auto-detected):
+
+| format | header | weights | notes |
+| ---    | ---    | ---     | ---   |
+| legacy (v0) | 28 B, 7 × `i32` | fp32 | what `export.py --version 0` and the tinyllamas checkpoints use; sign of `vocab_size` encodes classifier sharing |
+| v1 | 256 B, magic `ak42` | fp32 | same tensors, norms-first order, no legacy `freq_cis` padding tables |
+| v2 | 256 B, magic `ak42` | **int8** (Q8_0) | `runq.c`'s format: group-wise int8 with fp32 scales, RMSNorm gains fp32 |
+
+A v2 checkpoint always runs on the int8 path (`--quantize` is implied; the flag is
+ignored with a note). The loader de-interleaves the file's per-tensor data/scales
+into the engine's flat layout in one linear pass — no fp32 weights ever
+materialize, so both load time and peak memory beat quantize-at-load. `--convert
+<out> --to <v1|v2>` writes any fp32 checkpoint back out in either format; the v2
+writer uses the engine's own quantizer, so a converted file reproduces
+`--quantize` **bit-for-bit** (pinned in `host/tests/formats.rs`, alongside the
+byte-identical v1 gate). The tokenizer side is equally format-agnostic: any
+llama2.c-exported SentencePiece vocabulary works, including ones trained without
+byte-fallback tokens (unknown codepoints then encode as `<unk>` instead of
+indexing out of bounds).
 
 Upcoming: streaming-CLI polish, then `no_std` hardening polish.
 
@@ -161,7 +182,19 @@ reference kernels, or `--dotprod` to run int8 through the hardware dot-product k
 (x86 AVX-512 VNNI or ARM NEON `sdot`) — the fastest path on a CPU that has one (same
 output; see the table above).
 
-**Inspect a checkpoint** (no `--prompt` → report mode):
+**Convert a checkpoint** (`--convert <out>`, target `--to v1` or `--to v2`,
+default v2). Converting to v2 quantizes once, on disk — afterwards the file loads
+straight into the int8 path with no fp32 step and ~3.6× less disk and memory:
+
+```sh
+cargo run --release -p host -- models/stories15M.bin \
+  --convert models/stories15M.v2.bin --to v2 --group-size 32
+cargo run --release -p host -- \
+  models/stories15M.v2.bin models/tokenizer.bin --prompt "Once upon a time"
+```
+
+**Inspect a checkpoint** (no `--prompt` → report mode; the `format` line shows
+what was detected — `legacy (v0)`, `v1`, or `v2` with its group size):
 
 ```sh
 cargo run --release -p host -- models/stories15M.bin models/tokenizer.bin

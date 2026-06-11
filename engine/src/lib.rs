@@ -34,7 +34,7 @@ pub mod state;
 pub mod weights;
 
 pub use arena::Arena;
-pub use config::Config;
+pub use config::{parse_header, Config, ModelFormat};
 pub use error::EngineError;
 pub use model::{forward, Kernel, ModelWeights};
 pub use quantize::{QuantizedTensor, QuantizedWeights};
