@@ -27,7 +27,7 @@ const F32: usize = core::mem::size_of::<f32>();
 /// The int8 (W8A8) path's activation scratch is *not* part of this arena — it lives in a
 /// separate, caller-owned [`QuantScratch`](crate::QuantScratch), so an fp32 run budgets
 /// none of it.
-pub fn activation_floats(c: &Config) -> usize {
+pub const fn activation_floats(c: &Config) -> usize {
     let att_dim = c.n_heads * c.head_size();
     3 * c.dim                 // x, xb, xb2
         + 2 * c.hidden_dim    // hb, hb2
@@ -39,20 +39,29 @@ pub fn activation_floats(c: &Config) -> usize {
 /// The largest matmul input dimension `d_in` across all projections — the size each
 /// buffer of the W8A8 activation scratch ([`QuantScratch`](crate::QuantScratch)) must
 /// cover.
-pub fn max_proj_d_in(c: &Config) -> usize {
+pub const fn max_proj_d_in(c: &Config) -> usize {
     let att_dim = c.n_heads * c.head_size();
     // Wq/Wk/Wv/W1/W3/Wcls take `dim`; Wo takes `att_dim`; W2 takes `hidden_dim`.
-    c.dim.max(att_dim).max(c.hidden_dim)
+    // (`Ord::max` is not `const`, so pick the larger of each pair by hand.)
+    let a = if c.dim > att_dim { c.dim } else { att_dim };
+    if a > c.hidden_dim {
+        a
+    } else {
+        c.hidden_dim
+    }
 }
 
 /// Number of `f32` in the KV cache: key and value caches, each
 /// `n_layers * seq_len * kv_dim`.
-pub fn kv_cache_floats(c: &Config) -> usize {
+pub const fn kv_cache_floats(c: &Config) -> usize {
     2 * c.n_layers * c.seq_len * c.kv_dim()
 }
 
 /// Total `f32` the arena must hold: activations plus KV cache.
-pub fn arena_floats(c: &Config) -> usize {
+///
+/// `const`, so an embedded host can size a `static`/stack arena at compile time and
+/// even `const`-assert it fits a fixed memory budget — see `examples/baremetal.rs`.
+pub const fn arena_floats(c: &Config) -> usize {
     activation_floats(c) + kv_cache_floats(c)
 }
 
@@ -67,7 +76,7 @@ pub struct MemoryBudget {
 
 impl MemoryBudget {
     /// Compute the budget for a config.
-    pub fn for_config(c: &Config) -> Self {
+    pub const fn for_config(c: &Config) -> Self {
         MemoryBudget {
             activation_floats: activation_floats(c),
             kv_cache_floats: kv_cache_floats(c),
@@ -76,25 +85,25 @@ impl MemoryBudget {
 
     /// Total `f32` (activations + KV cache).
     #[inline]
-    pub fn total_floats(&self) -> usize {
+    pub const fn total_floats(&self) -> usize {
         self.activation_floats + self.kv_cache_floats
     }
 
     /// Activation bytes.
     #[inline]
-    pub fn activation_bytes(&self) -> usize {
+    pub const fn activation_bytes(&self) -> usize {
         self.activation_floats * F32
     }
 
     /// KV-cache bytes.
     #[inline]
-    pub fn kv_cache_bytes(&self) -> usize {
+    pub const fn kv_cache_bytes(&self) -> usize {
         self.kv_cache_floats * F32
     }
 
     /// Total arena bytes.
     #[inline]
-    pub fn total_bytes(&self) -> usize {
+    pub const fn total_bytes(&self) -> usize {
         self.total_floats() * F32
     }
 }
@@ -144,5 +153,30 @@ mod tests {
         // 920,960 f32 -> 3,683,840 bytes -> ~3.51 MiB (~3.68 MB).
         let mib = b.total_bytes() as f64 / (1024.0 * 1024.0);
         assert!((3.4..3.6).contains(&mib), "got {mib} MiB");
+    }
+
+    #[test]
+    fn budget_is_const_evaluable() {
+        // The whole budget is `const fn`, so an embedded host can size a `static`/stack
+        // arena and `const`-assert it fits a fixed RAM budget at compile time (exactly as
+        // `examples/baremetal.rs` does). These `const`s force that evaluation in a const
+        // context: if any budget function stopped being `const fn`, this would fail to
+        // compile rather than silently regress the bare-metal story.
+        const C: Config = Config {
+            dim: 288,
+            hidden_dim: 768,
+            n_layers: 6,
+            n_heads: 6,
+            n_kv_heads: 6,
+            vocab_size: 32000,
+            seq_len: 256,
+            shared_weights: true,
+        };
+        const FLOATS: usize = arena_floats(&C);
+        const BUDGET: MemoryBudget = MemoryBudget::for_config(&C);
+        const _: () = assert!(BUDGET.total_bytes() == FLOATS * F32);
+        assert_eq!(FLOATS, 36_224 + 884_736);
+        assert_eq!(BUDGET.total_floats(), FLOATS);
+        assert_eq!(max_proj_d_in(&C), 768);
     }
 }

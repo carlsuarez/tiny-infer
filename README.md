@@ -113,7 +113,14 @@ piped. A closed reader (e.g. `tiny-infer … | head`) ends the run quietly rathe
 erroring. The trailing status line reports prompt (prefill) and generation (decode)
 throughput separately, since those two phases scale differently.
 
-Upcoming: `no_std` hardening polish.
+**Bare-metal `no_std`.** The engine core compiles against nothing but `core` and
+`libm`, allocates nothing after init, and is built to run under `panic = "abort"`.
+Operations driven by file input (header parsing, weight carving, arena sizing) are
+fallible and return an `EngineError` rather than panicking, so a malformed checkpoint
+can never crash a caller; the memory budget is a `const fn` of the config, so a host can
+size a `static` arena at compile time. Beyond the build-only library check, a freestanding
+firmware example (`engine/examples/baremetal.rs`) supplies its own `#[panic_handler]` and
+runs a full forward pass out of stack buffers with no allocator — see [Test](#test).
 
 ## Workspace layout
 
@@ -247,3 +254,18 @@ target with no `std` available:
 ```sh
 cargo build -p engine --target thumbv7em-none-eabi
 ```
+
+That builds the library, which borrows the host's panic handler and allocator. To
+prove the engine stands on its own, the `baremetal` example is a freestanding
+`#![no_std]` / `#![no_main]` firmware binary that supplies its own `#[panic_handler]`
+and runs a full forward pass entirely out of stack buffers — no heap, no allocator, no
+`std`:
+
+```sh
+cargo build -p engine --example baremetal --target thumbv7em-none-eabi
+```
+
+(The same file builds as an ordinary example on a hosted target, where its `main` just
+points you at the command above. Because every transcendental routes through `libm`
+rather than `std`'s `f32` methods, the bare-metal build also fails fast if a `std`-only
+float intrinsic ever slips into the engine.)

@@ -25,9 +25,10 @@ use crate::error::EngineError;
 /// once. Tracks a high-water mark for peak-usage reporting.
 #[derive(Debug)]
 pub struct Arena<'buf> {
-    /// The not-yet-handed-out tail of the block. `None` only transiently while an
-    /// allocation is in flight.
-    free: Option<&'buf mut [f32]>,
+    /// The not-yet-handed-out tail of the block. Briefly swapped for an empty slice
+    /// (via [`core::mem::take`]) while an allocation splits it, so it is never
+    /// observably empty-by-accident — and the arena needs no panicking `unwrap`.
+    free: &'buf mut [f32],
     capacity: usize,
     used: usize,
 }
@@ -37,7 +38,7 @@ impl<'buf> Arena<'buf> {
     pub fn new(buf: &'buf mut [f32]) -> Self {
         let capacity = buf.len();
         Arena {
-            free: Some(buf),
+            free: buf,
             capacity,
             used: 0,
         }
@@ -49,18 +50,20 @@ impl<'buf> Arena<'buf> {
     /// Returns [`EngineError::ArenaOverflow`] if fewer than `n` elements remain;
     /// the arena is left unchanged on failure.
     pub fn alloc(&mut self, n: usize) -> Result<&'buf mut [f32], EngineError> {
-        // Take ownership of the free tail so we can split it without aliasing.
-        let free = self.free.take().expect("arena free tail is always present");
+        // Take ownership of the free tail (leaving an empty slice in its place) so we
+        // can split it without aliasing. `mem::take` keeps this allocation-free *and*
+        // panic-free — there is no fallible `unwrap`/`expect` anywhere in the arena.
+        let free = core::mem::take(&mut self.free);
         if n > free.len() {
             let available = core::mem::size_of_val(free);
-            self.free = Some(free); // restore; allocation failed
+            self.free = free; // restore; allocation failed
             return Err(EngineError::ArenaOverflow {
                 requested: n * core::mem::size_of::<f32>(),
                 available,
             });
         }
         let (head, tail) = free.split_at_mut(n);
-        self.free = Some(tail);
+        self.free = tail;
         self.used += n;
         head.fill(0.0);
         Ok(head)

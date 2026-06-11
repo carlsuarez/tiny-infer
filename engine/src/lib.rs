@@ -9,12 +9,36 @@
 //! arena ahead of time.
 //!
 //! The host crate (which *is* `std`) is responsible for file IO, the byte→`f32` cast,
-//! the tokenizer, and the CLI. Nothing in here allocates or panics on the hot path:
-//! fallible operations return [`EngineError`].
+//! the tokenizer, and the CLI.
 //!
 //! Milestone 1 implements config/weight parsing, the arena, and the memory budget.
 //! Milestone 2 adds the fp32 [`math`] kernels, the [`RunState`] working set, and the
 //! [`forward`] pass that turns a token into vocabulary logits.
+//!
+//! # `no_std` and panic policy
+//!
+//! The crate compiles against nothing but `core` and [`libm`] (for the transcendental
+//! functions `core` lacks). It is verified on a bare-metal target two ways: the library
+//! itself (`cargo build -p engine --target thumbv7em-none-eabi`) and a freestanding
+//! firmware binary that supplies its own `#[panic_handler]` and runs a full forward pass
+//! out of stack buffers with no allocator (`examples/baremetal.rs`). Because every
+//! transcendental goes through `libm` rather than `std`'s `f32` methods, that bare-metal
+//! build doubles as the guard against a `std`-only float intrinsic ever sneaking in — it
+//! simply would not compile.
+//!
+//! **Allocation.** Nothing here allocates. The working set is carved once from a
+//! caller-provided [`Arena`] and reused in place every step; the budget is a `const fn`
+//! of the [`Config`] ([`memory::arena_floats`]), so a host can size a `static` arena —
+//! and `const`-assert it fits a fixed RAM budget — at compile time.
+//!
+//! **Panics.** Every operation driven by *external* input — parsing a checkpoint header,
+//! carving the weight views, sizing the arena — is fallible and returns [`EngineError`]
+//! instead of panicking, so malformed files can never crash a caller. The remaining
+//! panic sites guard *internal* invariants (a programmer error, not input): the kernels'
+//! `debug_assert!` length checks, which compile out of release builds, plus core's own
+//! bounds/overflow checks on buffers whose sizes the validated [`Config`] already
+//! guarantees. The engine is built to run under `panic = "abort"` (the release profile
+//! sets it), needing no unwinder.
 
 #![no_std]
 // The SIMD matmul kernels in `math` use `core::simd`, which is still nightly-only;

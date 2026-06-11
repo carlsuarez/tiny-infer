@@ -32,7 +32,7 @@ use crate::error::EngineError;
 /// Number of `f32` elements a **legacy** checkpoint stores after the header —
 /// including the two skipped `freq_cis` tables, and the separate classifier
 /// matrix only when weights are not shared.
-pub fn weight_floats(c: &Config) -> usize {
+pub const fn weight_floats(c: &Config) -> usize {
     let freq = c.seq_len * (c.head_size() / 2);
     // Same tensors as v1 plus the two legacy-only freq_cis tables.
     weight_floats_v1(c) + 2 * freq
@@ -40,7 +40,7 @@ pub fn weight_floats(c: &Config) -> usize {
 
 /// Number of `f32` elements a **v1** checkpoint stores after its 256-byte header:
 /// every legacy tensor except the `freq_cis` tables (v1 dropped them).
-pub fn weight_floats_v1(c: &Config) -> usize {
+pub const fn weight_floats_v1(c: &Config) -> usize {
     let att_dim = c.n_heads * c.head_size();
     let kv_dim = c.kv_dim();
     let l = c.n_layers;
@@ -276,6 +276,29 @@ mod tests {
             expected_file_bytes(&c, ModelFormat::V1),
             crate::config::VERSIONED_HEADER_BYTES + (expect - 12) * 4
         );
+    }
+
+    #[test]
+    fn weight_floats_is_const_evaluable() {
+        // Both weight-size functions are `const fn` so a bare-metal host can size a
+        // `static`/stack weight buffer at compile time (see `examples/baremetal.rs`).
+        // Forcing the evaluation in a const context guards that const-ness against
+        // regressing: a non-`const` body would fail to compile here.
+        const C: Config = Config {
+            dim: 8,
+            hidden_dim: 16,
+            n_layers: 2,
+            n_heads: 2,
+            n_kv_heads: 1,
+            vocab_size: 32,
+            seq_len: 8,
+            shared_weights: true,
+        };
+        const LEGACY: usize = weight_floats(&C);
+        const V1: usize = weight_floats_v1(&C);
+        const _: () = assert!(LEGACY > V1); // legacy carries the two freq_cis tables
+        assert_eq!(weight_floats(&C), LEGACY);
+        assert_eq!(weight_floats_v1(&C), V1);
     }
 
     #[test]
