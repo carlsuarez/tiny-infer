@@ -229,7 +229,10 @@ fn run() -> Result<(), HostError> {
 /// picks the next token with a [`Sampler`]: while still inside the prompt it
 /// replays the prompt tokens; afterwards it samples from the logits (greedy when
 /// `temperature == 0`). Stops at `steps` or when the model emits BOS (the sequence
-/// delimiter). A tokens/sec line is written to stderr.
+/// delimiter). Each decoded piece is flushed immediately, so the text streams live
+/// rather than appearing in bursts; a closed reader (e.g. `| head`) ends the run
+/// quietly. A throughput line — prompt (prefill) and generation (decode) rates —
+/// is written to stderr.
 fn generate(
     config: &Config,
     weights: &ModelWeights,
@@ -264,7 +267,13 @@ fn generate(
     let stdout = io::stdout();
     let mut out = stdout.lock();
 
+    // Prefill (processing the prompt) and decode (sampling new tokens) scale very
+    // differently, so time them separately. `decode_start` marks the boundary: the
+    // instant of the first sample, taken once the prompt has been fully consumed.
     let start = Instant::now();
+    let mut decode_start: Option<Instant> = None;
+    let mut decode_tokens = 0usize;
+
     let mut token = prompt_tokens[0];
     let mut pos = 0usize;
     while pos < steps {
@@ -272,6 +281,8 @@ fn generate(
         let next = if pos + 1 < prompt_tokens.len() {
             prompt_tokens[pos + 1] // still replaying the prompt
         } else {
+            decode_start.get_or_insert_with(Instant::now); // prompt fully consumed
+            decode_tokens += 1;
             sampler.sample(logits) // generate the next token
         };
         pos += 1;
@@ -280,20 +291,62 @@ fn generate(
             break;
         }
         let piece = vocab.decode(token, next);
-        out.write_all(&piece)
-            .map_err(|e| HostError::io("<stdout>", e))?;
+        // Flush every piece so the text streams to the terminal as it is produced,
+        // instead of appearing in bursts at line boundaries (the lock is a
+        // `LineWriter`) or only at the end (when stdout is piped/block-buffered).
+        if let Err(e) = out.write_all(&piece).and_then(|()| out.flush()) {
+            // A closed reader (e.g. `tiny-infer … | head`) is routine for a
+            // streaming CLI: stop quietly instead of reporting an I/O error.
+            if e.kind() == io::ErrorKind::BrokenPipe {
+                return Ok(());
+            }
+            return Err(HostError::io("<stdout>", e));
+        }
         token = next;
     }
     let _ = out.write_all(b"\n");
     let _ = out.flush();
+    let end = Instant::now();
 
-    // Report throughput (skip trivially short runs).
-    if pos > 1 {
-        let secs = start.elapsed().as_secs_f64();
-        let tps = pos as f64 / secs;
-        eprintln!("[{pos} tokens, {secs:.3}s, {tps:.1} tok/s]");
-    }
+    report_throughput(start, decode_start, end, prompt_tokens.len().min(pos), decode_tokens);
     Ok(())
+}
+
+/// Print prompt (prefill) and generation (decode) throughput to stderr.
+///
+/// The two phases are timed separately because they scale differently: prefill runs
+/// one forward pass per prompt token before the first generated token appears, then
+/// decode samples one token per forward pass. `decode_start` is `None` when no token
+/// was generated (e.g. `--steps` shorter than the prompt), so only the prompt rate
+/// is shown.
+fn report_throughput(
+    start: Instant,
+    decode_start: Option<Instant>,
+    end: Instant,
+    prompt_tokens: usize,
+    decode_tokens: usize,
+) {
+    let rate =
+        |toks: usize, secs: f64| if secs > 0.0 { toks as f64 / secs } else { f64::INFINITY };
+    match decode_start {
+        Some(split) => {
+            let prefill = split.duration_since(start).as_secs_f64();
+            let decode = end.duration_since(split).as_secs_f64();
+            eprintln!(
+                "[prompt {prompt_tokens} tok in {prefill:.3}s ({:.1} tok/s), \
+                 generated {decode_tokens} tok in {decode:.3}s ({:.1} tok/s)]",
+                rate(prompt_tokens, prefill),
+                rate(decode_tokens, decode),
+            );
+        }
+        None => {
+            let secs = end.duration_since(start).as_secs_f64();
+            eprintln!(
+                "[prompt {prompt_tokens} tok in {secs:.3}s ({:.1} tok/s), generated 0 tok]",
+                rate(prompt_tokens, secs),
+            );
+        }
+    }
 }
 
 /// Turns a logits vector into the next token id.

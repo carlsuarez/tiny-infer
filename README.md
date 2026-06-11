@@ -106,7 +106,14 @@ llama2.c-exported SentencePiece vocabulary works, including ones trained without
 byte-fallback tokens (unknown codepoints then encode as `<unk>` instead of
 indexing out of bounds).
 
-Upcoming: streaming-CLI polish, then `no_std` hardening polish.
+**Streaming output.** Generation streams to stdout token by token — each decoded
+piece is flushed the moment it is produced, so text appears live instead of in
+bursts at line boundaries (the stdout lock is a `LineWriter`) or all at once when
+piped. A closed reader (e.g. `tiny-infer … | head`) ends the run quietly rather than
+erroring. The trailing status line reports prompt (prefill) and generation (decode)
+throughput separately, since those two phases scale differently.
+
+Upcoming: `no_std` hardening polish.
 
 ## Workspace layout
 
@@ -149,7 +156,7 @@ cargo run --release -p host -- \
 ```
 Once upon a time, there was a little girl named Lily. She loved to play outside
 in the sunshine. ...
-[80 tokens, 0.699s, 114.5 tok/s]
+[prompt 5 tok in 0.009s (539.4 tok/s), generated 75 tok in 0.655s (114.5 tok/s)]
 ```
 
 `--steps` defaults to the model's `seq_len`; generation stops early at the BOS

@@ -12,7 +12,7 @@
 //! So this both pins the reference parity and guards against regressions.
 
 use std::path::PathBuf;
-use std::process::Command;
+use std::process::{Command, Stdio};
 
 const BIN: &str = env!("CARGO_BIN_EXE_tiny-infer");
 
@@ -76,8 +76,36 @@ fn generation_reports_throughput_on_stderr() {
         .output()
         .unwrap();
     assert!(out.status.success());
+    // The throughput line reports prompt (prefill) and generation (decode) rates
+    // separately, each with a tok/s figure.
     let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(stderr.contains("prompt"), "stderr:\n{stderr}");
+    assert!(stderr.contains("generated"), "stderr:\n{stderr}");
     assert!(stderr.contains("tok/s"), "stderr:\n{stderr}");
+}
+
+#[test]
+fn streaming_to_a_closed_reader_exits_cleanly() {
+    let (Some(model), Some(tok)) = (fixture("stories15M.bin"), fixture("tokenizer.bin")) else {
+        eprintln!("skipping: fixtures not present");
+        return;
+    };
+
+    // Drop the read end of the pipe immediately after spawning. The child needs a few
+    // milliseconds to load the checkpoint before its first write, by which point the
+    // reader is gone — exactly the `tiny-infer … | head` case. The CLI treats the
+    // resulting BrokenPipe as a normal end-of-stream and exits 0, not as an error.
+    let mut child = Command::new(BIN)
+        .arg(&model)
+        .arg(&tok)
+        .args(["-p", "Once upon a time", "-n", "256", "--temperature", "0"])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .unwrap();
+    drop(child.stdout.take()); // close our read end before the child writes
+    let status = child.wait().unwrap();
+    assert!(status.success(), "closed reader should exit cleanly, got {status:?}");
 }
 
 #[test]
