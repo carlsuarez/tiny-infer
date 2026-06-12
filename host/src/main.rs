@@ -12,6 +12,7 @@
 mod convert;
 mod error;
 mod loader;
+mod seq2seq;
 mod tokenizer;
 
 use std::io::{self, Write};
@@ -31,6 +32,7 @@ use rand::{RngExt, SeedableRng};
 use crate::convert::Target;
 use crate::error::HostError;
 use crate::loader::Model;
+use crate::seq2seq::Seq2SeqModel;
 use crate::tokenizer::{Vocab, BOS_ID};
 
 const USAGE: &str = "\
@@ -73,7 +75,11 @@ OPTIONS:
 Reads all three llama2.c checkpoint formats: legacy (v0), v1 (fp32), and v2
 (pre-quantized int8 — implies the int8 path; -q is redundant). With no --prompt,
 tiny-infer prints the model config, validates the files, and reports the memory
-budget. With --prompt (and a tokenizer) it generates text.";
+budget. With --prompt (and a tokenizer) it generates text.
+
+Seq2seq (Marian / OPUS-MT translation) checkpoints exported by
+scripts/export_marian.py are detected automatically by their magic; for now they
+support report mode only (translation arrives in a later milestone).";
 
 fn main() -> ExitCode {
     match run() {
@@ -97,14 +103,23 @@ fn run() -> Result<(), HostError> {
     }
     let model_path = args
         .model
+        .clone()
         .ok_or_else(|| HostError::Usage("no model file given".into()))?;
     if args.to.is_some() && args.convert.is_none() {
-        return Err(HostError::Usage("`--to` requires `--convert <PATH>`".into()));
+        return Err(HostError::Usage(
+            "`--to` requires `--convert <PATH>`".into(),
+        ));
     }
     if args.convert.is_some() && args.prompt.is_some() {
         return Err(HostError::Usage(
             "`--convert` writes a checkpoint and exits; it cannot be combined with --prompt".into(),
         ));
+    }
+
+    // Seq2seq (Marian) checkpoints are a different architecture with their own
+    // loader; route them by the magic before touching the llama2.c parsers.
+    if seq2seq::is_seq2seq_file(&model_path)? {
+        return run_seq2seq(&model_path, &args);
     }
 
     let model = Model::load(&model_path)?;
@@ -223,6 +238,30 @@ fn run() -> Result<(), HostError> {
     Ok(())
 }
 
+/// Handle a seq2seq (Marian) checkpoint: validate it and print the report.
+///
+/// Translation, conversion, and quantization for this architecture arrive in
+/// later milestones, so any flag that implies them is rejected up front with a
+/// clear message rather than a confusing downstream failure.
+fn run_seq2seq(path: &str, args: &Args) -> Result<(), HostError> {
+    if args.prompt.is_some() || args.convert.is_some() || args.quantize {
+        return Err(HostError::Usage(
+            "seq2seq (Marian) checkpoints currently support report mode only; \
+             translation, conversion, and quantization arrive in later milestones"
+                .into(),
+        ));
+    }
+
+    let model = Seq2SeqModel::load(path)?;
+    // Validate the tensor carve, not just the byte count.
+    let _ = model.weights()?;
+    report_seq2seq(path, &model);
+    if args.tokenizer.is_some() {
+        println!("\nTokenizer: (SentencePiece support for seq2seq models lands with translation)");
+    }
+    Ok(())
+}
+
 /// Generate text from `prompt` and stream it to stdout.
 ///
 /// Tokenizes the prompt (with BOS), then for each position runs [`forward`] and
@@ -277,7 +316,15 @@ fn generate(
     let mut token = prompt_tokens[0];
     let mut pos = 0usize;
     while pos < steps {
-        let logits = forward(config, weights, &mut state, token, pos, kernel, &mut scratch);
+        let logits = forward(
+            config,
+            weights,
+            &mut state,
+            token,
+            pos,
+            kernel,
+            &mut scratch,
+        );
         let next = if pos + 1 < prompt_tokens.len() {
             prompt_tokens[pos + 1] // still replaying the prompt
         } else {
@@ -308,7 +355,13 @@ fn generate(
     let _ = out.flush();
     let end = Instant::now();
 
-    report_throughput(start, decode_start, end, prompt_tokens.len().min(pos), decode_tokens);
+    report_throughput(
+        start,
+        decode_start,
+        end,
+        prompt_tokens.len().min(pos),
+        decode_tokens,
+    );
     Ok(())
 }
 
@@ -326,8 +379,13 @@ fn report_throughput(
     prompt_tokens: usize,
     decode_tokens: usize,
 ) {
-    let rate =
-        |toks: usize, secs: f64| if secs > 0.0 { toks as f64 / secs } else { f64::INFINITY };
+    let rate = |toks: usize, secs: f64| {
+        if secs > 0.0 {
+            toks as f64 / secs
+        } else {
+            f64::INFINITY
+        }
+    };
     match decode_start {
         Some(split) => {
             let prefill = split.duration_since(start).as_secs_f64();
@@ -536,6 +594,105 @@ fn report_memory(model: &Model) {
     );
 }
 
+fn report_seq2seq(path: &str, model: &Seq2SeqModel) {
+    use engine::seq2seq::Seq2SeqMemoryBudget;
+    use engine::Activation;
+
+    let c = &model.config;
+    println!("Model: {path}");
+    println!("  status          OK (file size matches config)");
+    println!("  format          tiny-infer seq2seq v1 (Marian encoder-decoder), fp32 weights");
+    println!("  d_model         {}", c.d_model);
+    println!(
+        "  encoder         {} layers, {} heads (head_dim {}), ffn {}",
+        c.enc_layers,
+        c.enc_heads,
+        c.enc_head_dim(),
+        c.enc_ffn
+    );
+    println!(
+        "  decoder         {} layers, {} heads (head_dim {}), ffn {}",
+        c.dec_layers,
+        c.dec_heads,
+        c.dec_head_dim(),
+        c.dec_ffn
+    );
+    println!("  vocab_size      {}", c.vocab_size);
+    println!("  max_src/max_tgt {} / {}", c.max_src, c.max_tgt);
+    println!(
+        "  pad/eos/bos     {} / {} / {}  (decoder starts at pad)",
+        c.pad_id, c.eos_id, c.bos_id
+    );
+    println!(
+        "  norm placement  {}",
+        if c.norm_before {
+            "pre-norm"
+        } else {
+            "post-norm (Marian default)"
+        }
+    );
+    println!(
+        "  activation      {}",
+        match c.activation {
+            Activation::Gelu => "gelu",
+            Activation::Swish => "swish (SiLU)",
+        }
+    );
+    println!(
+        "  scale_embedding {}{}",
+        c.scale_embedding,
+        if c.scale_embedding {
+            " (embeddings × √d_model)"
+        } else {
+            ""
+        }
+    );
+    println!(
+        "  weights         {} ({})",
+        human_bytes(model.weight_bytes()),
+        commas(model.weight_bytes())
+    );
+
+    let budget = Seq2SeqMemoryBudget::for_config(c, c.max_src, c.max_tgt);
+    println!(
+        "\nMemory budget (working arena at max_src={} / max_tgt={}):",
+        c.max_src, c.max_tgt
+    );
+    println!(
+        "  encoder buffers {:>10}  ({} f32)",
+        human_bytes(budget.encoder_bytes()),
+        commas(budget.encoder_floats)
+    );
+    println!(
+        "  cross-KV cache  {:>10}  ({} f32)",
+        human_bytes(budget.cross_kv_bytes()),
+        commas(budget.cross_kv_floats)
+    );
+    println!(
+        "  self-KV cache   {:>10}  ({} f32)",
+        human_bytes(budget.self_kv_bytes()),
+        commas(budget.self_kv_floats)
+    );
+    println!(
+        "  step scratch    {:>10}  ({} f32)",
+        human_bytes(budget.step_bytes()),
+        commas(budget.step_floats)
+    );
+    println!(
+        "  arena total     {:>10}  ({} f32)",
+        human_bytes(budget.total_bytes()),
+        commas(budget.total_floats())
+    );
+    println!(
+        "  weights (disk)  {:>10}",
+        human_bytes(model.weight_bytes())
+    );
+    println!(
+        "  peak RAM        {:>10}  (weights + arena)",
+        human_bytes(model.weight_bytes() + budget.total_bytes())
+    );
+}
+
 /// Human-readable name of a checkpoint format, for the report.
 fn format_label(f: ModelFormat) -> String {
     match f {
@@ -562,7 +719,9 @@ fn select_kernel(scalar: bool, dotprod: bool) -> Kernel {
         if dotprod_available() {
             return Kernel::Dotprod;
         }
-        eprintln!("[--dotprod: CPU lacks a hardware int8 dot-product instruction; using SIMD instead]");
+        eprintln!(
+            "[--dotprod: CPU lacks a hardware int8 dot-product instruction; using SIMD instead]"
+        );
     }
     Kernel::Simd
 }
@@ -703,9 +862,7 @@ impl Args {
                 "-q" | "--quantize" => quantize = true,
                 "--scalar" => scalar = true,
                 "--dotprod" => dotprod = true,
-                "--group-size" => {
-                    group_size = parse_usize(&expect_value(&mut it, &arg)?, &arg)?
-                }
+                "--group-size" => group_size = parse_usize(&expect_value(&mut it, &arg)?, &arg)?,
                 "--convert" => convert = Some(expect_value(&mut it, &arg)?),
                 "--to" => to = Some(parse_target(&expect_value(&mut it, &arg)?)?),
                 s if s.starts_with("--model=") => model = Some(after_eq(s)),

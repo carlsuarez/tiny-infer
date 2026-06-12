@@ -36,6 +36,15 @@ pub enum EngineError {
         /// Bytes still free in the arena.
         available: usize,
     },
+    /// The file does not begin with the seq2seq checkpoint magic (`"tis2"`), so
+    /// it is not a tiny-infer seq2seq checkpoint.
+    #[cfg(feature = "seq2seq")]
+    NotSeq2Seq,
+    /// A seq2seq config field held a value the engine cannot use (e.g. zero, a
+    /// special-token id outside the vocabulary, or a head count that does not
+    /// divide `d_model`).
+    #[cfg(feature = "seq2seq")]
+    InvalidSeq2SeqConfig(Seq2SeqField),
 }
 
 /// Identifies which [`Config`](crate::Config) field failed validation.
@@ -62,6 +71,42 @@ pub enum ConfigField {
     GroupSize,
 }
 
+/// Identifies which [`Seq2SeqConfig`](crate::seq2seq::Seq2SeqConfig) field
+/// failed validation.
+#[cfg(feature = "seq2seq")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum Seq2SeqField {
+    /// `d_model` was zero.
+    DModel,
+    /// `enc_layers` was zero.
+    EncLayers,
+    /// `dec_layers` was zero.
+    DecLayers,
+    /// `enc_heads` was zero, or did not divide `d_model`.
+    EncHeads,
+    /// `dec_heads` was zero, or did not divide `d_model`.
+    DecHeads,
+    /// `enc_ffn` was zero.
+    EncFfn,
+    /// `dec_ffn` was zero.
+    DecFfn,
+    /// `vocab_size` was zero.
+    VocabSize,
+    /// `max_src` was zero.
+    MaxSrc,
+    /// `max_tgt` was zero.
+    MaxTgt,
+    /// `pad_id` was negative or not below `vocab_size`.
+    PadId,
+    /// `eos_id` was negative or not below `vocab_size`.
+    EosId,
+    /// `bos_id` was negative or not below `vocab_size`.
+    BosId,
+    /// The activation byte named no known activation (0 = GELU, 1 = swish).
+    Activation,
+}
+
 impl fmt::Display for EngineError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
@@ -86,6 +131,14 @@ impl fmt::Display for EngineError {
                 f,
                 "arena overflow: requested {requested} bytes, only {available} available"
             ),
+            #[cfg(feature = "seq2seq")]
+            EngineError::NotSeq2Seq => {
+                f.write_str("checkpoint does not start with the seq2seq magic \"tis2\"")
+            }
+            #[cfg(feature = "seq2seq")]
+            EngineError::InvalidSeq2SeqConfig(field) => {
+                write!(f, "invalid seq2seq model config: bad {field:?} field")
+            }
         }
     }
 }

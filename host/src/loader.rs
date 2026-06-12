@@ -77,10 +77,7 @@ impl Model {
     pub fn load(path: impl AsRef<Path>) -> Result<Model, HostError> {
         let path = path.as_ref();
         let mut file = File::open(path).map_err(|e| HostError::io(path, e))?;
-        let len = file
-            .metadata()
-            .map_err(|e| HostError::io(path, e))?
-            .len();
+        let len = file.metadata().map_err(|e| HostError::io(path, e))?.len();
 
         if !len.is_multiple_of(4) {
             return Err(HostError::NotF32Aligned {
@@ -216,11 +213,13 @@ impl Model {
 pub(crate) fn f32_as_bytes(floats: &[f32]) -> &[u8] {
     // SAFETY: `floats` is valid for `len*4` bytes; `u8` has no alignment or
     // validity requirements that `f32` storage does not already satisfy.
-    unsafe { std::slice::from_raw_parts(floats.as_ptr() as *const u8, std::mem::size_of_val(floats)) }
+    unsafe {
+        std::slice::from_raw_parts(floats.as_ptr() as *const u8, std::mem::size_of_val(floats))
+    }
 }
 
 /// Mutable counterpart of [`f32_as_bytes`], used to read the file in place.
-fn f32_as_bytes_mut(floats: &mut [f32]) -> &mut [u8] {
+pub(crate) fn f32_as_bytes_mut(floats: &mut [f32]) -> &mut [u8] {
     let len = std::mem::size_of_val(floats);
     // SAFETY: exclusive access to `floats`; same reasoning as `f32_as_bytes`.
     unsafe { std::slice::from_raw_parts_mut(floats.as_mut_ptr() as *mut u8, len) }

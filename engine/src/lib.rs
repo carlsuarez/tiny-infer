@@ -15,6 +15,11 @@
 //! Milestone 2 adds the fp32 [`math`] kernels, the [`RunState`] working set, and the
 //! [`forward`] pass that turns a token into vocabulary logits.
 //!
+//! Beyond the decoder-only Llama path, the [`seq2seq`] module (behind the on-by-default
+//! `seq2seq` cargo feature) adds a second architecture: Marian / OPUS-MT encoder-decoder
+//! translation models, with their own checkpoint format, weight views, and arena budget.
+//! Disable the feature for a decoder-only build.
+//!
 //! # `no_std` and panic policy
 //!
 //! The crate compiles against nothing but `core` and [`libm`] (for the transcendental
@@ -54,6 +59,8 @@ pub mod math;
 pub mod memory;
 pub mod model;
 pub mod quantize;
+#[cfg(feature = "seq2seq")]
+pub mod seq2seq;
 pub mod state;
 pub mod weights;
 
@@ -62,5 +69,7 @@ pub use config::{parse_header, Config, ModelFormat};
 pub use error::EngineError;
 pub use model::{forward, Kernel, ModelWeights};
 pub use quantize::{QuantizedTensor, QuantizedWeights};
+#[cfg(feature = "seq2seq")]
+pub use seq2seq::{Activation, Seq2SeqConfig, Seq2SeqWeights};
 pub use state::{QuantScratch, RunState};
 pub use weights::Weights;

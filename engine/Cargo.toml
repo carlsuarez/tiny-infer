@@ -11,3 +11,9 @@ path = "src/lib.rs"
 
 [dependencies]
 libm = "0.2.16"
+
+[features]
+default = ["seq2seq"]
+# The Marian-style encoder-decoder (translation) path. Disable for a leaner
+# decoder-only build: `default-features = false` compiles just the Llama path.
+seq2seq = []
