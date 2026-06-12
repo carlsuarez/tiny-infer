@@ -398,6 +398,35 @@ pub fn rmsnorm(out: &mut [f32], x: &[f32], w: &[f32]) {
     }
 }
 
+/// Layer normalization with weight **and** bias: `out = (x − μ)/√(σ² + ε) ⊙ w + b`.
+///
+/// `μ` and `σ²` are the mean and the **biased** variance (divided by `N`, not `N−1`)
+/// over the full length of `x`, and `ε = 1e-5` — matching PyTorch's `nn.LayerNorm`
+/// defaults, which is what Marian / OPUS-MT uses. This is the encoder-decoder
+/// counterpart of [`rmsnorm`]: RMSNorm drops the mean-centering and the bias, so the
+/// Llama path uses that while the Marian path uses this. Matching `ε` and the
+/// biased-variance convention exactly is what keeps the greedy MT token stream aligned
+/// with the reference.
+///
+/// # Panics
+/// In debug builds, if `out`, `x`, `w`, and `b` differ in length.
+pub fn layernorm(out: &mut [f32], x: &[f32], w: &[f32], b: &[f32]) {
+    const EPS: f32 = 1e-5;
+
+    debug_assert_eq!(out.len(), x.len());
+    debug_assert_eq!(x.len(), w.len());
+    debug_assert_eq!(w.len(), b.len());
+
+    let n = x.len() as f32;
+    let mean = x.iter().sum::<f32>() / n;
+    let var = x.iter().map(|&v| (v - mean) * (v - mean)).sum::<f32>() / n;
+    let inv_std = 1.0f32 / libm::sqrtf(var + EPS);
+
+    for (((o, &xi), &wi), &bi) in out.iter_mut().zip(x).zip(w).zip(b) {
+        *o = (xi - mean) * inv_std * wi + bi;
+    }
+}
+
 /// In-place numerically-stable softmax over `x`.
 ///
 /// Subtracts the max before exponentiating (so the largest term is `e^0 = 1` and
@@ -420,11 +449,101 @@ pub fn softmax(x: &mut [f32]) {
     }
 }
 
+/// One attention head's key and value vectors as they sit in a cache region.
+///
+/// `keys` and `values` are parallel flat slices holding one or more positions laid end
+/// to end; position `t`'s head vector is `[t*stride + head_off ..][..head_size]`. This
+/// is exactly the addressing the engine's KV caches use, so a head view can be built
+/// over any of them:
+///
+/// * decoder self-attention — `stride = kv_dim`, `head_off = (h / kv_mul) * head_size`
+///   (grouped-query: several query heads share one KV head);
+/// * encoder self-attention / cross-attention — `stride = d_model`, `head_off =
+///   h * head_size` (every head has its own K/V).
+#[derive(Clone, Copy)]
+pub struct KvHead<'a> {
+    /// Flat key cache; position `t`'s head vector starts at `t*stride + head_off`.
+    pub keys: &'a [f32],
+    /// Flat value cache, addressed identically to [`keys`](Self::keys).
+    pub values: &'a [f32],
+    /// Per-position width of the cache (e.g. `kv_dim`, or `d_model` for the seq2seq path).
+    pub stride: usize,
+    /// Offset of this head within one position's row.
+    pub head_off: usize,
+}
+
+/// Scaled dot-product attention for a single query head.
+///
+/// Scores `q` against the first `n_valid` key positions of `kv` (each score scaled by
+/// `scale`), softmaxes them (max-shifted) into `scores`, and writes the value-weighted
+/// sum into `out`. This is the one code path behind all three attention flavors — the
+/// only thing that varies is the valid window, expressed by `n_valid`:
+///
+/// * **causal** (decoder self-attention): `n_valid = pos + 1`, i.e. keys `0..=pos`;
+/// * **bidirectional** (encoder self-attention) and **cross-attention**: `n_valid =
+///   src_len`, i.e. every source key.
+///
+/// `out` and `q` are one head each (`head_size = out.len()`), and `scores` must hold at
+/// least `n_valid` elements (only `0..n_valid` is read or written). Allocates nothing.
+/// The score accumulation, softmax, and value sum run in the same order as the original
+/// hand-written decoder loop, so substituting this helper there is bit-for-bit neutral.
+///
+/// # Panics
+/// In debug builds, if `q` is not `head_size` long or `scores` is shorter than `n_valid`.
+pub fn attention_head(
+    out: &mut [f32],
+    q: &[f32],
+    kv: &KvHead,
+    n_valid: usize,
+    scale: f32,
+    scores: &mut [f32],
+) {
+    let head_size = out.len();
+    debug_assert_eq!(q.len(), head_size);
+    debug_assert!(scores.len() >= n_valid);
+
+    // Scaled dot-product score against every valid key.
+    for (t, score) in scores[..n_valid].iter_mut().enumerate() {
+        let off = t * kv.stride + kv.head_off;
+        let k_t = &kv.keys[off..off + head_size];
+        let mut dot = 0.0f32;
+        for i in 0..head_size {
+            dot += q[i] * k_t[i];
+        }
+        *score = dot * scale;
+    }
+
+    // Softmax over exactly the valid window.
+    softmax(&mut scores[..n_valid]);
+
+    // Weighted sum of the values back into this head's output.
+    out.fill(0.0);
+    for (t, &a) in scores[..n_valid].iter().enumerate() {
+        let off = t * kv.stride + kv.head_off;
+        let v_t = &kv.values[off..off + head_size];
+        for i in 0..head_size {
+            out[i] += a * v_t[i];
+        }
+    }
+}
+
 /// SiLU / swish activation: `z * σ(z) = z / (1 + e^-z)`.
 ///
 /// This is the gate non-linearity of the SwiGLU feed-forward block.
 pub fn silu(z: f32) -> f32 {
     z / (1.0 + libm::expf(-z))
+}
+
+/// Exact-erf GELU activation: `z · Φ(z) = 0.5·z·(1 + erf(z/√2))`.
+///
+/// `Φ` is the standard-normal CDF, computed exactly through `libm::erff` rather than the
+/// `tanh` approximation. This is Hugging Face's default `"gelu"` activation; the Marian
+/// feed-forward uses it when the model's `activation_function` is `gelu`, while [`silu`]
+/// covers the `swish` case (the two activations Marian / OPUS-MT models use). The engine
+/// never hardcodes one — the checkpoint's activation flag selects between them.
+pub fn gelu(z: f32) -> f32 {
+    use core::f32::consts::FRAC_1_SQRT_2; // 1/√2
+    0.5 * z * (1.0 + libm::erff(z * FRAC_1_SQRT_2))
 }
 
 /// Apply rotary position embeddings (RoPE) in place to `q` and `k` at `pos`.
@@ -471,6 +590,53 @@ pub fn rope(q: &mut [f32], k: &mut [f32], pos: usize, head_size: usize, dim: usi
     }
 }
 
+/// Write Marian's sinusoidal absolute position encoding for `pos` into `buf` (`dim`).
+///
+/// This is the OPUS-MT / Marian layout, which — unlike the classic *interleaved*
+/// "Attention Is All You Need" encoding — **concatenates** the two components: the first
+/// `⌈dim/2⌉` entries are sines and the rest are cosines (HF
+/// `MarianSinusoidalPositionalEmbedding`). Sine entry `s` and cosine entry `c` each use
+/// the frequency `10000^(−2k/dim)` of their own index `k`:
+///
+/// ```text
+/// buf[s]            = sin(pos · 10000^(−2s/dim))    for s in 0..⌈dim/2⌉
+/// buf[⌈dim/2⌉ + c]  = cos(pos · 10000^(−2c/dim))    for c in 0..⌊dim/2⌋
+/// ```
+///
+/// Positions start at index 0 (Marian has no BART `+2` offset). The result is *added* to
+/// the scaled token embedding (see [`embed_scale`]); it is recomputed per position rather
+/// than stored, so the checkpoint carries no position table. This is the Marian path's
+/// replacement for the Llama path's rotary [`rope`].
+///
+/// # Panics
+/// In debug builds, if `buf.len() != dim`.
+pub fn sinusoidal_into(buf: &mut [f32], pos: usize, dim: usize) {
+    debug_assert_eq!(buf.len(), dim);
+
+    // ⌈dim/2⌉: sines fill [0, sentinel), cosines fill [sentinel, dim).
+    let sentinel = dim.div_ceil(2);
+    let p = pos as f32;
+    let (sines, cosines) = buf.split_at_mut(sentinel);
+    for (s, slot) in sines.iter_mut().enumerate() {
+        let freq = 1.0 / libm::powf(10000.0, 2.0 * s as f32 / dim as f32);
+        *slot = libm::sinf(p * freq);
+    }
+    for (c, slot) in cosines.iter_mut().enumerate() {
+        let freq = 1.0 / libm::powf(10000.0, 2.0 * c as f32 / dim as f32);
+        *slot = libm::cosf(p * freq);
+    }
+}
+
+/// Embedding scale factor `√dim` for Marian's `scale_embedding`.
+///
+/// When a Marian model sets `scale_embedding = true`, every token embedding is multiplied
+/// by `√d_model` before the sinusoidal positions ([`sinusoidal_into`]) are added. Keeping
+/// it as a named helper puts the constant — and this parity note — in one place; models
+/// with `scale_embedding = false` simply skip the multiply.
+pub fn embed_scale(dim: usize) -> f32 {
+    libm::sqrtf(dim as f32)
+}
+
 /// Return the maximum element of `buf`.
 ///
 /// A small helper used by [`softmax`] for its max-shift. Unlike `Iterator::max`,
@@ -506,6 +672,16 @@ pub fn accumulate(dst: &mut [f32], src: &[f32]) {
     for (d, s) in dst.iter_mut().zip(src.iter()) {
         *d += *s;
     }
+}
+
+/// Add a bias vector into a linear layer's output in place: `out[i] += bias[i]`.
+///
+/// Marian's projections (q/k/v/o, fc1/fc2) and LayerNorms are all biased, unlike the
+/// Llama path's bias-free linears — a [`matmul`] followed by `add_bias` is one biased
+/// linear layer. Mechanically identical to [`accumulate`]; the separate name marks the
+/// separate intent (adding a learned bias, not folding in a residual).
+pub fn add_bias(out: &mut [f32], bias: &[f32]) {
+    accumulate(out, bias);
 }
 
 /// Index of the maximum element, taking the **first** on ties.
@@ -811,5 +987,162 @@ mod tests {
         // Ties resolve to the earliest index (strict `>`).
         assert_eq!(argmax(&[2.0, 2.0, 1.0, 2.0]), 0);
         assert_eq!(argmax(&[-3.0, -1.0, -1.0]), 1);
+    }
+
+    #[test]
+    fn layernorm_standardizes_then_applies_affine() {
+        // x=[1,2,3,4]: mean=2.5, biased var = mean((x-2.5)²) = 1.25.
+        let x = [1.0, 2.0, 3.0, 4.0];
+        let (mean, var) = (2.5f32, 1.25f32);
+        let inv = 1.0 / (var + 1e-5).sqrt();
+
+        // Unit gain, zero bias → pure standardization (≈ zero mean, unit variance).
+        let mut out = [0.0; 4];
+        layernorm(&mut out, &x, &[1.0; 4], &[0.0; 4]);
+        for (o, xi) in out.iter().zip(x.iter()) {
+            assert!(close(*o, (xi - mean) * inv));
+        }
+        let out_mean: f32 = out.iter().sum::<f32>() / 4.0;
+        assert!(out_mean.abs() < 1e-5);
+
+        // Affine weight + bias applied element-wise.
+        let w = [2.0, 0.5, 1.0, -1.0];
+        let b = [0.1, 0.2, 0.3, 0.4];
+        let mut out2 = [0.0; 4];
+        layernorm(&mut out2, &x, &w, &b);
+        for i in 0..4 {
+            assert!(close(out2[i], (x[i] - mean) * inv * w[i] + b[i]));
+        }
+    }
+
+    #[test]
+    fn gelu_known_values() {
+        assert!(close(gelu(0.0), 0.0));
+        // gelu(1) = 0.5·(1 + erf(1/√2)) ≈ 0.8413447
+        assert!(close(gelu(1.0), 0.841_344_7));
+        // gelu(-1) ≈ -0.1586553
+        assert!(close(gelu(-1.0), -0.158_655_3));
+        // Saturates to identity for large positive, to zero for large negative.
+        assert!(gelu(8.0) > 7.999);
+        assert!(gelu(-8.0).abs() < 1e-6);
+    }
+
+    #[test]
+    fn sinusoidal_matches_marian_layout() {
+        // Concatenated sin|cos (NOT interleaved): first ⌈dim/2⌉ sines, then cosines.
+        // pos=0 → sin(0)=0 across the first half, cos(0)=1 across the second.
+        let mut buf = [9.0f32; 8];
+        sinusoidal_into(&mut buf, 0, 8);
+        assert_eq!(buf, [0.0, 0.0, 0.0, 0.0, 1.0, 1.0, 1.0, 1.0]);
+
+        // pos=1, dim=8 — ground truth dumped from HF MarianSinusoidalPositionalEmbedding.
+        let mut buf = [0.0f32; 8];
+        sinusoidal_into(&mut buf, 1, 8);
+        let hf = [
+            0.841471, 0.099833, 0.01, 0.001, 0.540302, 0.995004, 0.99995, 1.0,
+        ];
+        for (b, h) in buf.iter().zip(hf.iter()) {
+            assert!(close(*b, *h), "{b} vs {h}");
+        }
+
+        // Odd dim: ⌈5/2⌉=3 sines then ⌊5/2⌋=2 cosines.
+        let mut buf = [7.0f32; 5];
+        sinusoidal_into(&mut buf, 0, 5);
+        assert_eq!(buf, [0.0, 0.0, 0.0, 1.0, 1.0]);
+    }
+
+    #[test]
+    fn embed_scale_is_sqrt_dim() {
+        assert!(close(embed_scale(4), 2.0));
+        assert!(close(embed_scale(512), 512.0f32.sqrt()));
+    }
+
+    #[test]
+    fn add_bias_adds_in_place() {
+        let mut out = [1.0, -2.0, 3.0];
+        add_bias(&mut out, &[0.5, 0.5, -1.0]);
+        assert_eq!(out, [1.5, -1.5, 2.0]);
+    }
+
+    #[test]
+    fn attention_head_single_key_returns_that_value() {
+        // One valid key ⇒ softmax is [1.0] ⇒ output is that position's value exactly,
+        // whatever the query or scale.
+        let keys = [0.3, -0.7, 1.1];
+        let values = [5.0, 6.0, 7.0];
+        let kv = KvHead {
+            keys: &keys,
+            values: &values,
+            stride: 3,
+            head_off: 0,
+        };
+        let q = [10.0, -4.0, 2.0];
+        let mut out = [0.0; 3];
+        let mut scores = [0.0; 1];
+        attention_head(&mut out, &q, &kv, 1, 0.25, &mut scores);
+        assert!(close(out[0], 5.0) && close(out[1], 6.0) && close(out[2], 7.0));
+    }
+
+    #[test]
+    fn attention_head_equal_scores_average_the_values() {
+        // Identical keys ⇒ equal scores ⇒ uniform softmax ⇒ the mean of the values.
+        // head_size 2, 3 positions, stride 2, head_off 0.
+        let keys = [1.0, 1.0, 1.0, 1.0, 1.0, 1.0];
+        let values = [0.0, 9.0, 3.0, 0.0, 6.0, 3.0];
+        let kv = KvHead {
+            keys: &keys,
+            values: &values,
+            stride: 2,
+            head_off: 0,
+        };
+        let q = [0.5, -0.5];
+        let mut out = [0.0; 2];
+        let mut scores = [0.0; 3];
+        attention_head(&mut out, &q, &kv, 3, 1.0, &mut scores);
+        assert!(close(out[0], (0.0 + 3.0 + 6.0) / 3.0)); // 3.0
+        assert!(close(out[1], (9.0 + 0.0 + 3.0) / 3.0)); // 4.0
+    }
+
+    #[test]
+    fn attention_head_matches_inline_reference_with_offset() {
+        // The helper must reproduce the original hand-written decoder loop bit-for-bit,
+        // with a non-zero head_off and a stride wider than head_size (several heads
+        // packed per cache row, as grouped-query attention produces).
+        let (head_size, n_valid, stride, head_off) = (3usize, 4usize, 6usize, 3usize);
+        let total = n_valid * stride;
+        let keys: Vec<f32> = (0..total).map(|i| (i as f32 * 0.13).sin()).collect();
+        let values: Vec<f32> = (0..total).map(|i| (i as f32 * 0.21).cos()).collect();
+        let q: Vec<f32> = (0..head_size).map(|i| (i as f32 * 0.7).cos()).collect();
+        let scale = 1.0 / (head_size as f32).sqrt();
+
+        // Reference: exactly the loop forward() ran before attention_head existed.
+        let mut ref_out = vec![0.0f32; head_size];
+        let mut att = vec![0.0f32; n_valid];
+        for (t, a) in att.iter_mut().enumerate() {
+            let off = t * stride + head_off;
+            let mut s = 0.0f32;
+            for i in 0..head_size {
+                s += q[i] * keys[off + i];
+            }
+            *a = s * scale;
+        }
+        softmax(&mut att);
+        for (t, &a) in att.iter().enumerate() {
+            let off = t * stride + head_off;
+            for i in 0..head_size {
+                ref_out[i] += a * values[off + i];
+            }
+        }
+
+        let kv = KvHead {
+            keys: &keys,
+            values: &values,
+            stride,
+            head_off,
+        };
+        let mut out = vec![0.0f32; head_size];
+        let mut scores = vec![0.0f32; n_valid];
+        attention_head(&mut out, &q, &kv, n_valid, scale, &mut scores);
+        assert_eq!(out, ref_out); // identical op order ⇒ exact
     }
 }

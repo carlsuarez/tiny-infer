@@ -1,4 +1,5 @@
 /target
 /models
 /venv
+/scripts/__pycache__
 .cargo/

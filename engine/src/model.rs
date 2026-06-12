@@ -314,38 +314,26 @@ pub fn forward<'s>(
             math::rope(s.q, krow, pos, head_size, dim, kv_dim);
         }
 
-        // Causal multi-head attention, written into `xb` head by head.
+        // Multi-head attention, written into `xb` head by head, via the shared
+        // `math::attention_head` (the same helper the seq2seq encoder/cross attention
+        // uses). Here the valid window is the causal prefix `0..=pos`.
         for h in 0..n_heads {
             let q_off = h * head_size;
-            let q_head = &s.q[q_off..q_off + head_size];
-            let kvh_off = (h / kv_mul) * head_size; // grouped-query: which KV head
             let att_off = h * seq_len;
-
-            // Scaled dot-product scores against every cached key up to `pos`.
-            for t in 0..=pos {
-                let k_off = loff + t * kv_dim + kvh_off;
-                let k_t = &s.key_cache[k_off..k_off + head_size];
-                let mut score = 0.0f32;
-                for i in 0..head_size {
-                    score += q_head[i] * k_t[i];
-                }
-                s.att[att_off + t] = score * scale;
-            }
-
-            // Softmax over exactly the valid (causal) window `0..=pos`.
-            math::softmax(&mut s.att[att_off..att_off + pos + 1]);
-
-            // Weighted sum of values back into this head's slice of `xb`.
-            let xb_head = &mut s.xb[q_off..q_off + head_size];
-            xb_head.fill(0.0);
-            for t in 0..=pos {
-                let v_off = loff + t * kv_dim + kvh_off;
-                let v_t = &s.value_cache[v_off..v_off + head_size];
-                let a = s.att[att_off + t];
-                for i in 0..head_size {
-                    xb_head[i] += a * v_t[i];
-                }
-            }
+            let kv = math::KvHead {
+                keys: &s.key_cache[loff..],
+                values: &s.value_cache[loff..],
+                stride: kv_dim,
+                head_off: (h / kv_mul) * head_size, // grouped-query: which KV head
+            };
+            math::attention_head(
+                &mut s.xb[q_off..q_off + head_size],
+                &s.q[q_off..q_off + head_size],
+                &kv,
+                pos + 1, // causal: keys 0..=pos are valid
+                scale,
+                &mut s.att[att_off..att_off + pos + 1],
+            );
         }
 
         // Output projection and the first residual add.
