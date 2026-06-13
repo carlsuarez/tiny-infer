@@ -20,8 +20,8 @@ use std::process::ExitCode;
 use std::time::Instant;
 
 use engine::math::{argmax, maxf};
-use engine::memory::{arena_floats, max_proj_d_in, MemoryBudget};
-use engine::quantize::{quantize_weights, quantized_scale_count, quantized_weight_count};
+use engine::llama::memory::{arena_floats, max_proj_d_in, MemoryBudget};
+use engine::llama::quantize::{quantize_weights, quantized_scale_count, quantized_weight_count};
 use engine::{
     forward, Arena, Config, Kernel, ModelFormat, ModelWeights, QuantScratch, QuantizedWeights,
     RunState,

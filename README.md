@@ -96,7 +96,7 @@ dedicated `vpdpbusd`/`sdot` instruction is what makes it pull ahead. On a CPU wi
 across all kernels. (The ARM `sdot` kernel mirrors the VNNI path and is bit-exact by
 construction; throughput is unbenchmarked here, as the dev machine is x86-64 only.)
 
-[`quantize_activation`]: engine/src/quantize.rs
+[`quantize_activation`]: engine/src/quant.rs
 
 **Checkpoint formats — legacy, v1, and v2 (`--convert`).** All three llama2.c
 export formats load transparently (the header is auto-detected):
@@ -139,17 +139,37 @@ runs a full forward pass out of stack buffers with no allocator — see [Test](#
 
 | crate / dir | role |
 |-------------|------|
-| `engine/`   | `#![no_std]` core: `Config` parsing, zero-copy `Weights` views, the bump `Arena`, and `memory` budget math. Depends only on `core`. |
+| `engine/`   | `#![no_std]`, allocation-free inference core. Depends only on `core` (+ `libm`). |
 | `host/`     | `std` CLI binary `tiny-infer`: file loading, tokenizer parsing, argument handling, and the reporting output. |
 | `host/tests/` | end-to-end CLI tests (metadata assertions run against the real fixtures when present). |
 | `scripts/`  | `export_marian.py`: converts a Hugging Face `MarianMTModel` (OPUS-MT) into tiny-infer's seq2seq checkpoint format. |
 | `models/`   | downloaded checkpoints (git-ignored). |
 
-The engine ships two architectures: the decoder-only Llama path and (behind the
-on-by-default `seq2seq` feature) the Marian encoder-decoder path under
-`engine/src/seq2seq/`. Both are `#![no_std]`, allocation-free, and arena-backed;
-`cargo build -p engine --no-default-features` compiles just the Llama path for a
-leaner embedded build.
+### Inside the engine: a shared core plus two architectures
+
+The engine's module tree makes the architecture split explicit. A small **shared
+core** holds the building blocks that don't depend on any one model shape, and two
+**parallel, self-contained architecture modules** sit on top of it — they never
+reference each other, meeting only at the shared core.
+
+```
+engine/src/
+  lib.rs           # crate root; re-exports the Llama API as engine::Config, engine::forward, …
+  arena.rs         # shared: the bump Arena every working buffer is carved from
+  error.rs         # shared: the crate-wide EngineError
+  math.rs          # shared: fp32 + int8 compute kernels (matmul, norms, attention, RoPE, …)
+  quant.rs         # shared: group-wise int8 quantization primitives (QuantizedTensor, quantize/dequantize)
+  llama/           # decoder-only Llama-2 (llama2.c-compatible): RMSNorm, RoPE, SwiGLU, causal GQA
+    config.rs weights.rs memory.rs state.rs model.rs quantize.rs
+  seq2seq/         # encoder-decoder Marian / OPUS-MT: LayerNorm+bias, sinusoidal positions, cross-attention
+    config.rs weights.rs memory.rs state.rs model.rs
+```
+
+The `llama/` path is always compiled in and defines the public crate-root API
+(`engine::Config`, `engine::Weights`, `engine::forward`, …, all re-exported from
+`llama`). The `seq2seq/` path sits behind the on-by-default `seq2seq` feature;
+`cargo build -p engine --no-default-features` drops it for a leaner decoder-only
+embedded build. Both are `#![no_std]`, allocation-free, and arena-backed.
 
 The engine works in units of `f32` — the element type of every activation and
 KV-cache buffer — so the arena hands out disjoint `&mut [f32]` slices with no

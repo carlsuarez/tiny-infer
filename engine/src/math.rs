@@ -27,7 +27,7 @@
 //!
 //! [`Arena`]: crate::Arena
 
-use crate::quantize::QuantizedTensor;
+use crate::quant::QuantizedTensor;
 use core::simd::num::{SimdFloat, SimdInt};
 use core::simd::{f32x8, i32x8, i8x8};
 
@@ -113,7 +113,7 @@ pub fn matmul_simd(out: &mut [f32], x: &[f32], w: &[f32], d_in: usize, d_out: us
 /// Full int8 (**W8A8**) matrix–vector product `out = W · x` (scalar).
 ///
 /// Both operands are int8: `qw` is the group-wise quantized weight, and the activation
-/// is pre-quantized by [`quantize_activation`](crate::quantize::quantize_activation)
+/// is pre-quantized by [`quantize_activation`](crate::quant::quantize_activation)
 /// into `xq` (integer-valued `f32`, range `−127..=127`) with one scale per group in
 /// `x_scales`. Within each group the dot product is accumulated in **`i32`** (exact —
 /// no float rounding), then the integer sum is scaled by `w_scale · x_scale` and folded
@@ -228,7 +228,7 @@ pub fn matmul_q8_simd(
 /// *unsigned* × *signed* bytes, so each weight is offset by `+128` in-register (mapping
 /// the stored `i8` to the `u8` the instruction wants) and the per-group correction
 /// `128 · Σ(activations)` — precomputed in `x_gsums` by
-/// [`quantize_activation`](crate::quantize::quantize_activation) — is subtracted back
+/// [`quantize_activation`](crate::quant::quantize_activation) — is subtracted back
 /// out: `Σ wₖaₖ = Σ(wₖ+128)aₖ − 128·Σaₖ`. The integer dot product is exact, so this is
 /// **bit-identical** to the scalar [`matmul_q8`].
 ///
@@ -754,7 +754,7 @@ mod tests {
         let mut xq = vec![0i8; x.len()];
         let mut xs = vec![0.0f32; x.len() / gs];
         let mut xg = vec![0.0f32; x.len() / gs];
-        crate::quantize::quantize_activation(&mut xq, &mut xs, &mut xg, x, gs);
+        crate::quant::quantize_activation(&mut xq, &mut xs, &mut xg, x, gs);
         (xq, xs, xg)
     }
 

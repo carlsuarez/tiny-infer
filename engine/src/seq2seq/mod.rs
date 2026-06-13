@@ -20,18 +20,24 @@
 //! * [`weights`] — the fp32 tensor layout and zero-copy [`Seq2SeqWeights`] views.
 //! * [`memory`] — `const fn` arena budgets for the encoder buffers, the cross-
 //!   and self-KV caches, and the per-step scratch.
+//! * [`state`] — [`Seq2SeqState`], the working buffers carved once from the arena.
+//! * [`model`] — [`encode`], the Marian encoder forward pass (the decoder and
+//!   greedy decode follow in a later milestone).
 //!
-//! The forward passes (encoder, then decoder + cross-attention) build on these in
-//! later milestones; like the Llama path they will be allocation-free and carve
-//! their working set once from the caller's [`Arena`](crate::Arena).
+//! Like the Llama path, the forward passes are allocation-free and carve their
+//! working set once from the caller's [`Arena`](crate::Arena).
 //!
 //! [`Config`]: crate::Config
 //! [`forward`]: crate::forward
 
 pub mod config;
 pub mod memory;
+pub mod model;
+pub mod state;
 pub mod weights;
 
 pub use config::{Activation, Seq2SeqConfig};
 pub use memory::{seq2seq_arena_floats, Seq2SeqMemoryBudget};
+pub use model::encode;
+pub use state::Seq2SeqState;
 pub use weights::{expected_seq2seq_file_bytes, seq2seq_weight_floats, Seq2SeqWeights};

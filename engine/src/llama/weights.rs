@@ -7,7 +7,7 @@
 //!
 //! The two fp32 formats store the **same tensors in different orders**
 //! ([`Weights::new`] parses legacy, [`Weights::new_v1`] parses v1); the int8 v2
-//! format is handled by [`crate::quantize`] instead. With
+//! format is handled by [`crate::llama::quantize`] instead. With
 //! `att_dim = n_heads * head_size` and `kv_dim`:
 //!
 //! | legacy (v0)         | v1                  | length (`f32`)               |
@@ -26,7 +26,7 @@
 //! | `freq_cis_real`/`imag` *(legacy only, skipped — RoPE is computed live)* | — | `seq_len * head_size/2` × 2 |
 //! | `wcls` *(only if not shared)* | `wcls` *(ditto)* | `vocab * dim`     |
 
-use crate::config::{Config, ModelFormat};
+use crate::llama::config::{Config, ModelFormat};
 use crate::error::EngineError;
 
 /// Number of `f32` elements a **legacy** checkpoint stores after the header —
@@ -67,7 +67,7 @@ pub const fn weight_floats_v1(c: &Config) -> usize {
 /// the format's header plus its weight payload.
 ///
 /// For [`ModelFormat::V2`] the payload is the fp32 RMSNorm gains followed by the
-/// int8 weights and their `f32` scales (see [`crate::quantize`]).
+/// int8 weights and their `f32` scales (see [`crate::llama::quantize`]).
 pub fn expected_file_bytes(c: &Config, format: ModelFormat) -> usize {
     const F32: usize = core::mem::size_of::<f32>();
     format.header_bytes()
@@ -76,8 +76,8 @@ pub fn expected_file_bytes(c: &Config, format: ModelFormat) -> usize {
             ModelFormat::V1 => weight_floats_v1(c) * F32,
             ModelFormat::V2 { group_size } => {
                 let norms = 2 * c.n_layers * c.dim + c.dim; // rms_att + rms_ffn + rms_final
-                let data = crate::quantize::quantized_weight_count(c);
-                let scales = crate::quantize::quantized_scale_count(c, group_size);
+                let data = crate::llama::quantize::quantized_weight_count(c);
+                let scales = crate::llama::quantize::quantized_scale_count(c, group_size);
                 norms * F32 + data + scales * F32
             }
         }
@@ -268,13 +268,13 @@ mod tests {
         assert_eq!(weight_floats(&c), expect);
         assert_eq!(
             expected_file_bytes(&c, ModelFormat::Legacy),
-            crate::config::HEADER_BYTES + expect * 4
+            crate::llama::config::HEADER_BYTES + expect * 4
         );
         // v1 drops the two freq_cis tables (12 floats here) and pays the bigger header.
         assert_eq!(weight_floats_v1(&c), expect - 12);
         assert_eq!(
             expected_file_bytes(&c, ModelFormat::V1),
-            crate::config::VERSIONED_HEADER_BYTES + (expect - 12) * 4
+            crate::llama::config::VERSIONED_HEADER_BYTES + (expect - 12) * 4
         );
     }
 
@@ -307,9 +307,9 @@ mod tests {
         let gs = 2;
         // fp32 norms: rms_att 8 + rms_ffn 8 + rms_final 4 = 20 floats.
         // int8 data: every quantized weight, 1 byte each; scales: one f32 per group.
-        let data = crate::quantize::quantized_weight_count(&c);
+        let data = crate::llama::quantize::quantized_weight_count(&c);
         let expect =
-            crate::config::VERSIONED_HEADER_BYTES + 20 * 4 + data + (data / gs) * 4;
+            crate::llama::config::VERSIONED_HEADER_BYTES + 20 * 4 + data + (data / gs) * 4;
         assert_eq!(
             expected_file_bytes(&c, ModelFormat::V2 { group_size: gs }),
             expect

@@ -29,9 +29,9 @@ use std::fs::File;
 use std::io::Read;
 use std::path::{Path, PathBuf};
 
-use engine::config::VERSIONED_HEADER_BYTES;
-use engine::quantize::{quantized_scale_count, quantized_weight_count, v2_tensor_sizes};
-use engine::weights::expected_file_bytes;
+use engine::llama::config::VERSIONED_HEADER_BYTES;
+use engine::llama::quantize::{quantized_scale_count, quantized_weight_count, v2_tensor_sizes};
+use engine::llama::weights::expected_file_bytes;
 use engine::{parse_header, Config, ModelFormat, Weights};
 
 use crate::error::HostError;
@@ -144,7 +144,7 @@ impl Model {
     ///
     /// The file stores, per tensor (and per layer), int8 data followed by its
     /// `f32` scales; the engine wants one flat data buffer and one flat scales
-    /// buffer ([`engine::quantize::quantize_weights`]' layout). Both walks visit
+    /// buffer ([`engine::llama::quantize::quantize_weights`]' layout). Both walks visit
     /// the tensors in the same order ([`v2_tensor_sizes`]), so appending each
     /// part as it is encountered produces exactly that layout. The RMSNorm gains
     /// (fp32, stored before the tensors) are copied out alongside. One linear

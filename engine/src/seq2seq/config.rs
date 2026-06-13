@@ -292,7 +292,7 @@ mod tests {
     fn rejects_wrong_magic() {
         // A llama2.c versioned header must not parse as seq2seq.
         let mut bytes = header(OPUS_EN_FR, OPUS_FLAGS);
-        bytes[0..4].copy_from_slice(&crate::config::MAGIC.to_le_bytes());
+        bytes[0..4].copy_from_slice(&crate::llama::config::MAGIC.to_le_bytes());
         assert_eq!(
             Seq2SeqConfig::parse(&bytes).unwrap_err(),
             EngineError::NotSeq2Seq

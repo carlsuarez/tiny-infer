@@ -39,8 +39,8 @@ fn main() {
 mod firmware {
     use core::panic::PanicInfo;
 
-    use engine::memory::{arena_floats, MemoryBudget};
-    use engine::weights::weight_floats;
+    use engine::llama::memory::{arena_floats, MemoryBudget};
+    use engine::llama::weights::weight_floats;
     use engine::{forward, math, Arena, Config, Kernel, ModelWeights, RunState, Weights};
 
     /// A tiny synthetic model. Small enough that every buffer fits comfortably on the

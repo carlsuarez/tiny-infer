@@ -19,7 +19,7 @@
 //!   an `i32` version, the same seven `i32` fields (with `vocab_size` always
 //!   positive), a `u8` shared-classifier flag, and — v2 only — the `i32`
 //!   quantization group size; the rest is zero padding. v1 stores fp32 weights
-//!   (in a different order from legacy, see [`crate::weights`]); v2 stores the
+//!   (in a different order from legacy, see [`crate::llama::weights`]); v2 stores the
 //!   matmul weights pre-quantized to int8 (`runq.c`'s Q8_0 format).
 //!
 //! The detected variant is reported as a [`ModelFormat`], which the loader uses to
@@ -150,7 +150,7 @@ impl Config {
     /// which detects the versioned formats and falls back to this.
     ///
     /// Only the first [`HEADER_BYTES`] are read; trailing weight data is ignored
-    /// here (see [`crate::weights`]). Returns [`EngineError::HeaderTooShort`] if
+    /// here (see [`crate::llama::weights`]). Returns [`EngineError::HeaderTooShort`] if
     /// `bytes` is too small, or [`EngineError::InvalidConfig`] if a field is
     /// unusable.
     pub fn parse(bytes: &[u8]) -> Result<Config, EngineError> {

@@ -9,7 +9,7 @@
 //! [`slice::split_at_mut`], with **no `unsafe` and no aliasing**: each allocation
 //! is a disjoint sub-slice of the original block. The host supplies a properly
 //! aligned `&mut [f32]` (e.g. a `vec![0.0f32; n]`), sized via
-//! [`crate::memory::arena_floats`].
+//! [`crate::llama::memory::arena_floats`].
 //!
 //! The intended lifecycle is *allocate-once*: a `RunState` carves all of its
 //! buffers from the arena during initialization and then reuses them in place for

@@ -12,7 +12,7 @@
 //! [`Arena`]: crate::Arena
 
 use crate::arena::Arena;
-use crate::config::Config;
+use crate::llama::config::Config;
 use crate::error::EngineError;
 
 /// All mutable buffers a single forward pass reads and writes.
@@ -20,7 +20,7 @@ use crate::error::EngineError;
 /// Every field borrows a disjoint sub-slice of the arena block (`'buf`); because
 /// [`Arena::alloc`] hands back slices tied to the block's lifetime rather than to
 /// the arena borrow, they can all be held at once. Buffer sizes come straight from
-/// the [`Config`] and match [`crate::memory`]'s budget.
+/// the [`Config`] and match [`crate::llama::memory`]'s budget.
 #[derive(Debug)]
 pub struct RunState<'buf> {
     /// Residual stream, `[dim]`.
@@ -49,7 +49,7 @@ impl<'buf> RunState<'buf> {
     /// Carve every buffer out of `arena` for the given config.
     ///
     /// Allocates in a fixed order; the total is exactly
-    /// [`crate::memory::arena_floats`]. Returns [`EngineError::ArenaOverflow`] if
+    /// [`crate::llama::memory::arena_floats`]. Returns [`EngineError::ArenaOverflow`] if
     /// the arena was sized too small (size it with `arena_floats` to guarantee a
     /// fit).
     /// Carve every buffer out of `arena` for the given config.
@@ -80,9 +80,9 @@ impl<'buf> RunState<'buf> {
 ///
 /// Holds the quantized activation (`xq`, `i8`) plus its per-group `scales` and per-group
 /// integer `gsums` (the VNNI correction term), all filled fresh by
-/// [`quantize_activation`](crate::quantize::quantize_activation) before each int8 matmul.
+/// [`quantize_activation`](crate::quant::quantize_activation) before each int8 matmul.
 /// All three buffers are caller-owned (the arena vends only `f32`, and `xq` is `i8`), and
-/// each must be at least [`max_proj_d_in`](crate::memory::max_proj_d_in) long. Build one
+/// each must be at least [`max_proj_d_in`](crate::llama::memory::max_proj_d_in) long. Build one
 /// only when generating with `--quantize`; pass `None` to [`forward`](crate::forward) on
 /// the fp32 path.
 #[derive(Debug)]
@@ -98,7 +98,7 @@ pub struct QuantScratch<'buf> {
 impl<'buf> QuantScratch<'buf> {
     /// Bundle three caller-owned buffers as an activation scratch.
     ///
-    /// Each buffer must be at least [`max_proj_d_in`](crate::memory::max_proj_d_in) long
+    /// Each buffer must be at least [`max_proj_d_in`](crate::llama::memory::max_proj_d_in) long
     /// (the largest matmul input dimension, with one group per element in the worst
     /// case). Returns [`EngineError::ArenaOverflow`] if any is short.
     pub fn new(
@@ -107,7 +107,7 @@ impl<'buf> QuantScratch<'buf> {
         gsums: &'buf mut [f32],
         c: &Config,
     ) -> Result<QuantScratch<'buf>, EngineError> {
-        let need = crate::memory::max_proj_d_in(c);
+        let need = crate::llama::memory::max_proj_d_in(c);
         let have = xq.len().min(scales.len()).min(gsums.len());
         if have < need {
             return Err(EngineError::ArenaOverflow {
@@ -122,7 +122,7 @@ impl<'buf> QuantScratch<'buf> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::memory::arena_floats;
+    use crate::llama::memory::arena_floats;
 
     extern crate std;
     use std::vec;
@@ -177,7 +177,7 @@ mod tests {
     #[test]
     fn quant_scratch_checks_buffer_lengths() {
         let c = tiny_config();
-        let need = crate::memory::max_proj_d_in(&c);
+        let need = crate::llama::memory::max_proj_d_in(&c);
         let (mut xq, mut sc, mut gs) = (vec![0i8; need], vec![0.0f32; need], vec![0.0f32; need]);
         assert!(QuantScratch::new(&mut xq, &mut sc, &mut gs, &c).is_ok());
 

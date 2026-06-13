@@ -7,7 +7,7 @@
 //! The layout mirrors llama2.c's `RunState`: a set of activation scratch buffers
 //! plus the KV cache. The KV cache dominates and grows with `n_layers * seq_len`.
 
-use crate::config::Config;
+use crate::llama::config::Config;
 
 const F32: usize = core::mem::size_of::<f32>();
 
