@@ -23,15 +23,19 @@
 //! forward pass:
 //!
 //! * [`llama`] — the decoder-only **Llama-2** path (llama2.c-compatible: RMSNorm,
-//!   RoPE, SwiGLU, causal GQA). Always compiled in; it defines the crate-root API
-//!   ([`Config`], [`Weights`], [`forward`], [`ModelWeights`], …, all re-exported
-//!   here from [`llama`]).
+//!   RoPE, SwiGLU, causal GQA). Always compiled in. Its public types
+//!   ([`Config`](llama::Config), [`Weights`](llama::Weights),
+//!   [`forward`](llama::forward), [`ModelWeights`](llama::ModelWeights), …) are
+//!   reached through the module path, `engine::llama::*`.
 //! * [`seq2seq`] — the encoder-decoder **Marian / OPUS-MT** path (LayerNorm with
-//!   bias, sinusoidal positions, cross-attention). Behind the on-by-default
-//!   `seq2seq` cargo feature; disable it for a lean decoder-only build.
+//!   bias, sinusoidal positions, cross-attention), reached through
+//!   `engine::seq2seq::*`. Behind the on-by-default `seq2seq` cargo feature; disable
+//!   it for a lean decoder-only build.
 //!
 //! The two architecture modules never reference each other — they meet only at the
-//! shared core — so the directory layout mirrors exactly how separate they are.
+//! shared core — so the directory layout mirrors exactly how separate they are. Each
+//! names its config `Config`, its weights `Weights`, and its working set `RunState`;
+//! the module path keeps them distinct.
 //!
 //! # `no_std` and panic policy
 //!
@@ -46,7 +50,7 @@
 //!
 //! **Allocation.** Nothing here allocates. The working set is carved once from a
 //! caller-provided [`Arena`] and reused in place every step; the budget is a `const fn`
-//! of the [`Config`] ([`llama::memory::arena_floats`]), so a host can size a `static` arena —
+//! of the [`Config`](llama::Config) ([`llama::memory::arena_floats`]), so a host can size a `static` arena —
 //! and `const`-assert it fits a fixed RAM budget — at compile time.
 //!
 //! **Panics.** Every operation driven by *external* input — parsing a checkpoint header,
@@ -54,7 +58,7 @@
 //! instead of panicking, so malformed files can never crash a caller. The remaining
 //! panic sites guard *internal* invariants (a programmer error, not input): the kernels'
 //! `debug_assert!` length checks, which compile out of release builds, plus core's own
-//! bounds/overflow checks on buffers whose sizes the validated [`Config`] already
+//! bounds/overflow checks on buffers whose sizes the validated [`Config`](llama::Config) already
 //! guarantees. The engine is built to run under `panic = "abort"` (the release profile
 //! sets it), needing no unwinder.
 
@@ -71,24 +75,15 @@ pub mod error;
 pub mod math;
 pub mod quant;
 
-// Architectures, each layered on the shared core.
+// Architectures, each layered on the shared core. Their public types are reached
+// through the module path — `engine::llama::Config`, `engine::seq2seq::Config`, … —
+// so the two never collide and the directory layout *is* the API surface.
 pub mod llama;
 #[cfg(feature = "seq2seq")]
 pub mod seq2seq;
 
-// Shared-core re-exports.
+// Shared-core re-exports (architecture-agnostic, so unqualified at the root).
 pub use arena::Arena;
 pub use error::EngineError;
-pub use quant::QuantizedTensor;
-
-// Llama-2 (decoder-only) is the crate-root API — re-exported unqualified so callers
-// use `engine::Config`, `engine::forward`, … without naming the architecture.
-pub use llama::config::{parse_header, Config, ModelFormat};
-pub use llama::model::{forward, Kernel, ModelWeights};
-pub use llama::quantize::QuantizedWeights;
-pub use llama::state::{QuantScratch, RunState};
-pub use llama::weights::Weights;
-
-// Seq2seq (encoder-decoder), behind the `seq2seq` feature.
-#[cfg(feature = "seq2seq")]
-pub use seq2seq::{encode, Activation, Seq2SeqConfig, Seq2SeqState, Seq2SeqWeights};
+pub use math::Kernel;
+pub use quant::{QuantScratch, QuantizedTensor};

@@ -1,8 +1,8 @@
 //! Zero-copy views into a seq2seq checkpoint's `f32` weight region.
 //!
-//! After the [`Seq2SeqConfig`] header, a seq2seq checkpoint stores every tensor
+//! After the [`Config`] header, a seq2seq checkpoint stores every tensor
 //! as raw little-endian `f32`, back to back, in the fixed order below —
-//! `scripts/export_marian.py` writes it and [`Seq2SeqWeights::new`] carves it.
+//! `scripts/export_marian.py` writes it and [`Weights::new`] carves it.
 //! As on the Llama path, each named tensor is stored **flat across layers**
 //! (layer `l`'s rows begin at `l * rows * cols`), and nothing is copied or
 //! reshaped: every field borrows straight out of the host's file buffer.
@@ -35,14 +35,14 @@
 //! | `final_logits_bias` | `[V]` | added to the tied lm_head's logits |
 //!
 //! (Whether each LayerNorm runs before or after its sublayer is the
-//! [`norm_before`](Seq2SeqConfig::norm_before) flag's business, not the file
+//! [`norm_before`](Config::norm_before) flag's business, not the file
 //! layout's; the storage order above is fixed either way.)
 
 use crate::error::EngineError;
-use crate::seq2seq::config::{Seq2SeqConfig, SEQ2SEQ_HEADER_BYTES};
+use crate::seq2seq::config::{Config, SEQ2SEQ_HEADER_BYTES};
 
 /// Number of `f32` elements a seq2seq checkpoint stores after its header.
-pub const fn seq2seq_weight_floats(c: &Seq2SeqConfig) -> usize {
+pub const fn weight_floats(c: &Config) -> usize {
     let d = c.d_model;
     // One attention block: four d×d projections with their four d-vector biases,
     // plus the sublayer's LayerNorm weight and bias.
@@ -59,8 +59,8 @@ pub const fn seq2seq_weight_floats(c: &Seq2SeqConfig) -> usize {
 
 /// Total on-disk size of a seq2seq checkpoint with this config, in bytes:
 /// the fixed header plus the fp32 weight payload.
-pub const fn expected_seq2seq_file_bytes(c: &Seq2SeqConfig) -> usize {
-    SEQ2SEQ_HEADER_BYTES + seq2seq_weight_floats(c) * core::mem::size_of::<f32>()
+pub const fn expected_file_bytes(c: &Config) -> usize {
+    SEQ2SEQ_HEADER_BYTES + weight_floats(c) * core::mem::size_of::<f32>()
 }
 
 /// Borrowed, zero-copy views of every seq2seq weight tensor.
@@ -69,7 +69,7 @@ pub const fn expected_seq2seq_file_bytes(c: &Seq2SeqConfig) -> usize {
 /// pass's responsibility. Shapes are given as `[layers, rows, cols]` /
 /// `[layers, len]` in the field docs, with `d = d_model`.
 #[derive(Debug, Clone, Copy)]
-pub struct Seq2SeqWeights<'a> {
+pub struct Weights<'a> {
     /// Shared token embedding table, `[vocab, d]` — encoder input, decoder
     /// input, and (tied) lm_head all read this one matrix.
     pub token_embedding: &'a [f32],
@@ -172,15 +172,15 @@ pub struct Seq2SeqWeights<'a> {
     pub final_logits_bias: &'a [f32],
 }
 
-impl<'a> Seq2SeqWeights<'a> {
+impl<'a> Weights<'a> {
     /// Carve the weight tensors out of the checkpoint's `f32` region.
     ///
     /// `floats` must be the file's contents *after* the header, reinterpreted as
     /// `f32` (the host performs that aligned cast). Returns
     /// [`EngineError::SizeMismatch`] if `floats` is shorter than the config
     /// requires.
-    pub fn new(floats: &'a [f32], c: &Seq2SeqConfig) -> Result<Seq2SeqWeights<'a>, EngineError> {
-        let needed = seq2seq_weight_floats(c);
+    pub fn new(floats: &'a [f32], c: &Config) -> Result<Weights<'a>, EngineError> {
+        let needed = weight_floats(c);
         if floats.len() < needed {
             return Err(EngineError::SizeMismatch {
                 expected: needed * core::mem::size_of::<f32>(),
@@ -199,7 +199,7 @@ impl<'a> Seq2SeqWeights<'a> {
             head
         };
 
-        Ok(Seq2SeqWeights {
+        Ok(Weights {
             token_embedding: take(c.vocab_size * d),
 
             enc_wq: take(le * d * d),
@@ -258,8 +258,8 @@ mod tests {
     use super::*;
     use crate::seq2seq::config::Activation;
 
-    fn tiny_config() -> Seq2SeqConfig {
-        Seq2SeqConfig {
+    fn tiny_config() -> Config {
+        Config {
             d_model: 4,
             enc_layers: 1,
             dec_layers: 1,
@@ -287,11 +287,8 @@ mod tests {
         // enc layer = 88 + 84 = 172; dec layer = 2*88 + 84 = 260.
         // emb 10*4=40, final_logits_bias 10.
         let expect = 40 + 172 + 260 + 10;
-        assert_eq!(seq2seq_weight_floats(&c), expect);
-        assert_eq!(
-            expected_seq2seq_file_bytes(&c),
-            SEQ2SEQ_HEADER_BYTES + expect * 4
-        );
+        assert_eq!(weight_floats(&c), expect);
+        assert_eq!(expected_file_bytes(&c), SEQ2SEQ_HEADER_BYTES + expect * 4);
     }
 
     #[test]
@@ -299,8 +296,8 @@ mod tests {
         // Fill the buffer with its own indices so each slice's first element
         // reveals the offset it was carved from — proving the disk order.
         let c = tiny_config();
-        let buf: std::vec::Vec<f32> = (0..seq2seq_weight_floats(&c)).map(|i| i as f32).collect();
-        let w = Seq2SeqWeights::new(&buf, &c).unwrap();
+        let buf: std::vec::Vec<f32> = (0..weight_floats(&c)).map(|i| i as f32).collect();
+        let w = Weights::new(&buf, &c).unwrap();
 
         assert_eq!(w.token_embedding[0], 0.0);
         assert_eq!(w.token_embedding.len(), 40);
@@ -325,15 +322,15 @@ mod tests {
         // The logit bias is the file's tail; the carve must land exactly at EOF.
         assert_eq!(w.final_logits_bias[0], 472.0);
         assert_eq!(w.final_logits_bias.len(), c.vocab_size);
-        assert_eq!(472 + c.vocab_size, seq2seq_weight_floats(&c));
+        assert_eq!(472 + c.vocab_size, weight_floats(&c));
     }
 
     #[test]
     fn short_slice_is_rejected() {
         let c = tiny_config();
-        let buf = std::vec![0.0f32; seq2seq_weight_floats(&c) - 1];
+        let buf = std::vec![0.0f32; weight_floats(&c) - 1];
         assert!(matches!(
-            Seq2SeqWeights::new(&buf, &c),
+            Weights::new(&buf, &c),
             Err(EngineError::SizeMismatch { .. })
         ));
     }
@@ -343,7 +340,7 @@ mod tests {
         // Like the Llama path's `weight_floats`, the size math is `const fn` so a
         // bare-metal host can size a static weight buffer at compile time; forcing
         // the evaluation in a const context guards that against regressing.
-        const C: Seq2SeqConfig = Seq2SeqConfig {
+        const C: Config = Config {
             d_model: 4,
             enc_layers: 1,
             dec_layers: 1,
@@ -361,8 +358,8 @@ mod tests {
             activation: Activation::Swish,
             scale_embedding: true,
         };
-        const FLOATS: usize = seq2seq_weight_floats(&C);
-        const BYTES: usize = expected_seq2seq_file_bytes(&C);
+        const FLOATS: usize = weight_floats(&C);
+        const BYTES: usize = expected_file_bytes(&C);
         const _: () = assert!(BYTES == SEQ2SEQ_HEADER_BYTES + FLOATS * 4);
         assert_eq!(FLOATS, 482);
     }

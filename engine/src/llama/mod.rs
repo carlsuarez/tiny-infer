@@ -37,8 +37,10 @@ pub mod state;
 pub mod weights;
 
 pub use config::{parse_header, Config, ModelFormat};
+pub use crate::math::Kernel;
 pub use memory::{arena_floats, MemoryBudget};
-pub use model::{forward, Kernel, ModelWeights};
+pub use model::{forward, ModelWeights};
+pub use crate::quant::QuantScratch;
 pub use quantize::{quantize_weights, QuantizedWeights};
-pub use state::{QuantScratch, RunState};
+pub use state::RunState;
 pub use weights::Weights;

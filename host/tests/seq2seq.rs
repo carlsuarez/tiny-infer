@@ -9,8 +9,7 @@ use std::path::PathBuf;
 use std::process::Command;
 
 use engine::seq2seq::config::{SEQ2SEQ_HEADER_BYTES, SEQ2SEQ_VERSION};
-use engine::seq2seq::seq2seq_weight_floats;
-use engine::{Activation, Seq2SeqConfig};
+use engine::seq2seq::{weight_floats, Activation, Config as Seq2SeqConfig};
 
 const BIN: &str = env!("CARGO_BIN_EXE_tiny-infer");
 
@@ -73,7 +72,7 @@ fn header_bytes(c: &Seq2SeqConfig) -> Vec<u8> {
 fn write_synthetic(name: &str) -> PathBuf {
     let c = tiny_config();
     let mut bytes = header_bytes(&c);
-    bytes.extend(std::iter::repeat_n(0u8, seq2seq_weight_floats(&c) * 4));
+    bytes.extend(std::iter::repeat_n(0u8, weight_floats(&c) * 4));
     let path = std::env::temp_dir().join(name);
     std::fs::write(&path, &bytes).unwrap();
     path
@@ -105,7 +104,10 @@ fn reports_synthetic_seq2seq_checkpoint() {
 }
 
 #[test]
-fn seq2seq_prompt_is_rejected_cleanly() {
+fn seq2seq_prompt_without_tokenizer_is_usage_error() {
+    // Translating needs the SentencePiece tokenizer artifact. The synthetic
+    // checkpoint sits alone in a temp dir with no tokenizer.bin beside it and none
+    // passed, so the prompt is a clean usage error — not a crash.
     let path = write_synthetic("tiny_infer_seq2seq_prompt.bin");
     let out = Command::new(BIN)
         .arg(&path)
@@ -116,7 +118,7 @@ fn seq2seq_prompt_is_rejected_cleanly() {
 
     assert!(!out.status.success());
     let stderr = String::from_utf8_lossy(&out.stderr);
-    assert!(stderr.contains("report mode only"), "stderr:\n{stderr}");
+    assert!(stderr.contains("tokenizer"), "stderr:\n{stderr}");
     assert!(!stderr.contains("panicked"), "stderr:\n{stderr}");
 }
 
@@ -166,4 +168,40 @@ fn reports_real_opus_mt_checkpoint() {
         stdout.contains("encoder         6 layers, 8 heads (head_dim 64), ffn 2048"),
         "stdout:\n{stdout}"
     );
+}
+
+#[test]
+fn translates_real_opus_mt() {
+    // End-to-end gate: the tokenizer + encoder-decoder must reproduce Hugging Face's
+    // greedy translations. Needs model.bin + tokenizer.bin (export_marian.py +
+    // dump_tokenizer.py); skips otherwise.
+    let dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("..")
+        .join("models")
+        .join("opus-mt-en-fr");
+    if !dir.join("model.bin").exists() || !dir.join("tokenizer.bin").exists() {
+        eprintln!("skipping: opus-mt-en-fr model.bin / tokenizer.bin not present");
+        return;
+    }
+    // Reference outputs from HF MarianMTModel.generate(num_beams=1, do_sample=False).
+    let cases = [
+        ("Hello, world!", "Bonjour, le monde !"),
+        ("This is a small test.", "C'est un petit test."),
+        ("I love programming.", "J'adore la programmation."),
+    ];
+    for (src, want) in cases {
+        let out = Command::new(BIN)
+            .arg(dir.join("model.bin"))
+            .args(["--prompt", src])
+            .output()
+            .unwrap();
+        assert!(
+            out.status.success(),
+            "exit {:?}\nstderr: {}",
+            out.status.code(),
+            String::from_utf8_lossy(&out.stderr)
+        );
+        let got = String::from_utf8_lossy(&out.stdout);
+        assert_eq!(got.trim(), want, "translation of {src:?}");
+    }
 }

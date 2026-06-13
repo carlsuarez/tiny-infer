@@ -15,7 +15,8 @@ use std::path::PathBuf;
 
 use engine::seq2seq::config::SEQ2SEQ_HEADER_BYTES;
 use engine::seq2seq::memory::seq2seq_arena_floats;
-use engine::{encode, Arena, Seq2SeqConfig, Seq2SeqState, Seq2SeqWeights};
+use engine::seq2seq::{encode, Config, KeptWeights, ModelWeights, RunState, Weights};
+use engine::{Arena, Kernel};
 
 /// Reinterpret a little-endian byte buffer as `f32` (the host's job in production;
 /// done safely here, one element at a time, for the test).
@@ -64,15 +65,17 @@ fn encoder_output_matches_hugging_face() {
     // --- load the checkpoint and run the engine encoder ---
     let model_bytes = std::fs::read(&model_path).unwrap();
     let floats = as_f32(&model_bytes);
-    let config = Seq2SeqConfig::parse(&model_bytes).expect("parse seq2seq header");
+    let config = Config::parse(&model_bytes).expect("parse seq2seq header");
     assert_eq!(config.d_model, d, "fixture/model d_model disagree");
-    let weights = Seq2SeqWeights::new(&floats[SEQ2SEQ_HEADER_BYTES / 4..], &config).unwrap();
+    let weights = Weights::new(&floats[SEQ2SEQ_HEADER_BYTES / 4..], &config).unwrap();
+    let kept = KeptWeights::from_weights(&weights);
+    let mw = ModelWeights::F32(weights);
 
     let mut arena_buf = vec![0.0f32; seq2seq_arena_floats(&config, src_len, 0)];
     let mut arena = Arena::new(&mut arena_buf);
-    let mut state = Seq2SeqState::new(&mut arena, &config, src_len, 0).unwrap();
+    let mut state = RunState::new(&mut arena, &config, src_len, 0).unwrap();
 
-    let out = encode(&config, &weights, &mut state, &tokens);
+    let out = encode(&config, &mw, &kept, &mut state, &tokens, Kernel::Simd, &mut None);
     assert_eq!(out.len(), expected.len());
 
     // --- compare ---

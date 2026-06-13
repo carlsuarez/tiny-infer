@@ -10,5 +10,8 @@ name = "tiny-infer"
 path = "src/main.rs"
 
 [dependencies]
+bytemuck = "1.25.0"
 engine = { path = "../engine" }
+humansize = "2.1.3"
 rand = "0.10.1"
+thousands = "0.2.0"

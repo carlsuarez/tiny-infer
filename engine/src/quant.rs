@@ -15,6 +15,8 @@
 //! than using a single scale for a whole row. Value `k` dequantizes to
 //! `data[k] as f32 * scales[k / group_size]`.
 
+use crate::error::EngineError;
+
 /// A group-wise int8-quantized weight matrix: 8-bit values plus per-group scales.
 ///
 /// Element `k` dequantizes to `data[k] as f32 * scales[k / group_size]`. `data`
@@ -169,6 +171,50 @@ pub fn dequantize(out: &mut [f32], qx: &QuantizedTensor) {
     debug_assert_eq!(out.len(), qx.data.len());
     for (k, o) in out.iter_mut().enumerate() {
         *o = qx.data[k] as f32 * qx.scales[k / qx.group_size];
+    }
+}
+
+/// Per-matmul activation scratch for the int8 (W8A8) path — architecture-agnostic.
+///
+/// Holds the quantized activation (`xq`, `i8`) plus its per-group `scales` and per-group
+/// integer `gsums` (the VNNI correction term), all filled fresh by [`quantize_activation`]
+/// before each int8 matmul by [`matmul_w8a8`](crate::math::matmul_w8a8). It is kept
+/// separate from either architecture's `RunState` so an fp32 run carries none of it.
+///
+/// The three buffers are caller-owned (the arena vends only `f32`, and `xq` is `i8`), and
+/// each must be at least as long as the largest matmul input dimension a forward pass will
+/// feed it — `max_proj_d_in` on the Llama path, `seq2seq_max_proj_d_in` on the seq2seq
+/// path. Build one only when running quantized; pass `None` to the forward pass otherwise.
+#[derive(Debug)]
+pub struct QuantScratch<'buf> {
+    /// Quantized activation values, `i8`.
+    pub xq: &'buf mut [i8],
+    /// Per-group activation scales.
+    pub scales: &'buf mut [f32],
+    /// Per-group activation integer sums (VNNI `−128·Σa` correction).
+    pub gsums: &'buf mut [f32],
+}
+
+impl<'buf> QuantScratch<'buf> {
+    /// Bundle three caller-owned buffers as an activation scratch.
+    ///
+    /// Each buffer must be at least `need` long — the largest matmul input dimension
+    /// (`d_in`) any projection will feed this scratch, with one group per element in the
+    /// worst case. Returns [`EngineError::ArenaOverflow`] if any buffer is short.
+    pub fn new(
+        xq: &'buf mut [i8],
+        scales: &'buf mut [f32],
+        gsums: &'buf mut [f32],
+        need: usize,
+    ) -> Result<QuantScratch<'buf>, EngineError> {
+        let have = xq.len().min(scales.len()).min(gsums.len());
+        if have < need {
+            return Err(EngineError::ArenaOverflow {
+                requested: need,
+                available: have,
+            });
+        }
+        Ok(QuantScratch { xq, scales, gsums })
     }
 }
 

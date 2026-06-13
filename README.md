@@ -29,18 +29,33 @@ default) stays deterministic/greedy, a higher temperature draws each token from 
 softmax distribution, and `--topp <F>` restricts that draw to the most-probable
 tokens whose probabilities sum to `F`. `--seed` makes a sampled run reproducible.
 
-**Milestone 9 — seq2seq translation: format & loader (done).** First step toward a
-second architecture: Marian / OPUS-MT encoder-decoder translation models, added
-*alongside* the decoder-only path without touching it (the llama2.c parity gate stays
-bit-identical). This milestone lands the on-disk format (a versioned header with its
-own `"tis2"` magic), the zero-copy `Seq2SeqWeights` views, the `const fn` arena budget
-(encoder buffers + cross-attention KV cache + decoder self-KV cache + per-step
-scratch), a Python `scripts/export_marian.py` that dumps a Hugging Face `MarianMTModel`
-into that format, and host loading + report. The CLI auto-detects a seq2seq checkpoint
-by its magic and prints its config and memory budget; the encoder/decoder forward
-passes and translation arrive in later milestones. The whole architecture sits behind
-an on-by-default `seq2seq` cargo feature, so a decoder-only embedded build
-(`--no-default-features`) carries none of it.
+**Seq2seq translation (Marian / OPUS-MT) — end to end (done).** A second
+architecture, added *alongside* the decoder-only path without touching it (the
+llama2.c parity gate stays bit-identical): bidirectional encoder, cross-attention,
+LayerNorm with bias, sinusoidal positions, a tied lm_head with `final_logits_bias`.
+`tiny-infer models/opus-mt-en-fr/model.bin --prompt "Hello, world!"` prints
+`Bonjour, le monde !`. The pieces:
+
+* **Format + export** — a versioned header with its own `"tis2"` magic, zero-copy
+  weight views, and a `const fn` arena budget (encoder buffers + cross-attention KV
+  cache + decoder self-KV cache + per-step scratch). `scripts/export_marian.py` dumps
+  a Hugging Face `MarianMTModel` to that format and emits the tokenizer artifact.
+* **Encoder + decoder** — allocation-free, arena-backed forward passes built from the
+  same `no_std` kernels, running on the scalar, `core::simd`, or hardware int8
+  dot-product kernels (`--scalar` selects the reference path; SIMD is the default, ~6×
+  faster and bit-identical in its greedy output). Two correctness gates against Hugging
+  Face transformers: the encoder's `last_hidden_state` matches to ~2e-6, and greedy
+  decode matches `generate(num_beams=1, do_sample=False)` **token-for-token**.
+* **Tokenizer** — a from-scratch SentencePiece **Unigram** tokenizer (Viterbi over the
+  piece-score table) that reproduces `MarianTokenizer` on ordinary text.
+* **Int8 quantization** — `--quantize` / `--group-size` / `--dotprod` work for
+  translation exactly as they do for Llama generation (below): the 17 matmul matrices
+  (the tied embedding included) quantize to int8 while biases and LayerNorms stay fp32,
+  the fp32 checkpoint is freed at load (~285 → ~76 MiB), and the hardware dot-product
+  kernel makes int8 a speed win too (~2.3× over the fp32 SIMD path on the OPUS model).
+
+The whole architecture sits behind an on-by-default `seq2seq` cargo feature, so a
+decoder-only embedded build (`--no-default-features`) carries none of it.
 
 **Int8 quantization (`--quantize`).** All the matmul weights — the seven layer
 projections and the token-embedding/classifier table — can be quantized to group-wise
@@ -140,9 +155,9 @@ runs a full forward pass out of stack buffers with no allocator — see [Test](#
 | crate / dir | role |
 |-------------|------|
 | `engine/`   | `#![no_std]`, allocation-free inference core. Depends only on `core` (+ `libm`). |
-| `host/`     | `std` CLI binary `tiny-infer`: file loading, tokenizer parsing, argument handling, and the reporting output. |
-| `host/tests/` | end-to-end CLI tests (metadata assertions run against the real fixtures when present). |
-| `scripts/`  | `export_marian.py`: converts a Hugging Face `MarianMTModel` (OPUS-MT) into tiny-infer's seq2seq checkpoint format. |
+| `host/`     | `std` CLI binary `tiny-infer`: file loading, tokenizers, generation/translation, argument handling, reporting. Split into `llama/` and `seq2seq/` modules mirroring the engine. |
+| `host/tests/` | end-to-end CLI tests (metadata + parity assertions run against the real fixtures when present). |
+| `scripts/`  | `export_marian.py` converts a Hugging Face `MarianMTModel` (OPUS-MT) to tiny-infer's seq2seq format; `dump_tokenizer.py` builds the tokenizer artifact; `dump_*_ref.py` capture Hugging Face parity references. |
 | `models/`   | downloaded checkpoints (git-ignored). |
 
 ### Inside the engine: a shared core plus two architectures
@@ -154,27 +169,36 @@ reference each other, meeting only at the shared core.
 
 ```
 engine/src/
-  lib.rs           # crate root; re-exports the Llama API as engine::Config, engine::forward, …
+  lib.rs           # crate root; re-exports the shared core (Arena, EngineError, QuantizedTensor, QuantScratch, Kernel)
   arena.rs         # shared: the bump Arena every working buffer is carved from
   error.rs         # shared: the crate-wide EngineError
-  math.rs          # shared: fp32 + int8 compute kernels (matmul, norms, attention, RoPE, …)
-  quant.rs         # shared: group-wise int8 quantization primitives (QuantizedTensor, quantize/dequantize)
+  math.rs          # shared: fp32 + int8 compute kernels (matmul, W8A8, norms, attention, RoPE, …)
+  quant.rs         # shared: group-wise int8 quantization primitives (QuantizedTensor, QuantScratch, quantize/dequantize)
   llama/           # decoder-only Llama-2 (llama2.c-compatible): RMSNorm, RoPE, SwiGLU, causal GQA
     config.rs weights.rs memory.rs state.rs model.rs quantize.rs
   seq2seq/         # encoder-decoder Marian / OPUS-MT: LayerNorm+bias, sinusoidal positions, cross-attention
-    config.rs weights.rs memory.rs state.rs model.rs
+    config.rs weights.rs memory.rs state.rs model.rs quantize.rs
 ```
 
-The `llama/` path is always compiled in and defines the public crate-root API
-(`engine::Config`, `engine::Weights`, `engine::forward`, …, all re-exported from
-`llama`). The `seq2seq/` path sits behind the on-by-default `seq2seq` feature;
-`cargo build -p engine --no-default-features` drops it for a leaner decoder-only
-embedded build. Both are `#![no_std]`, allocation-free, and arena-backed.
+Each architecture's public types are reached through its module path —
+`engine::llama::{Config, Weights, forward, …}` and `engine::seq2seq::{Config, Weights,
+encode, greedy_decode, …}` — so the two never collide and the directory layout *is*
+the API surface. The `llama/` path is always compiled in; the `seq2seq/` path sits
+behind the on-by-default `seq2seq` feature, and `cargo build -p engine
+--no-default-features` drops it for a leaner decoder-only embedded build. Both are
+`#![no_std]`, allocation-free, and arena-backed.
+
+The host mirrors that split: `host/src/{llama,seq2seq}/` each own their loader,
+tokenizer, driver (generate / translate), and report code, over a small shared base
+(`error`, `args`), with `main.rs` a thin dispatcher that routes a checkpoint to
+the right module by its magic.
 
 The engine works in units of `f32` — the element type of every activation and
 KV-cache buffer — so the arena hands out disjoint `&mut [f32]` slices with no
-`unsafe` and no aliasing. The single audited `unsafe` cast lives in
-`host/src/loader.rs`, reinterpreting the loaded file as `f32`.
+`unsafe` and no aliasing. The host reinterprets a checkpoint's `f32` storage as bytes
+(to read the file in one pass) with a *safe* [`bytemuck`](https://docs.rs/bytemuck)
+cast, so neither crate carries any `unsafe` of its own — except the engine's one
+cfg-gated x86 block for the AVX-512 VNNI int8 kernel.
 
 ## Getting the model
 
@@ -248,12 +272,19 @@ cargo run --release -p host -- \
 ```
 
 **Translation models (Marian / OPUS-MT).** Export a Hugging Face encoder-decoder
-translation model to tiny-infer's seq2seq format, then inspect it (translation
-itself is a later milestone):
+translation model to tiny-infer's seq2seq format, then translate with `--prompt`
+(the tokenizer is found next to the model automatically):
 
 ```sh
 pip install torch transformers sentencepiece
 python scripts/export_marian.py Helsinki-NLP/opus-mt-en-fr -o models/opus-mt-en-fr
+cargo run --release -p host -- models/opus-mt-en-fr/model.bin --prompt "Hello, world!"
+# -> Bonjour, le monde !
+```
+
+Without `--prompt` it reports the model instead:
+
+```sh
 cargo run --release -p host -- models/opus-mt-en-fr/model.bin
 ```
 
@@ -285,7 +316,13 @@ Model: models/stories15M.bin
 Memory budget (working arena, pre-allocated once):
   activations      141.50 KiB  (36,224 f32)
   KV cache           3.38 MiB  (884,736 f32)
-  arena total        3.52 MiB  (920,960 f32)
+  arena total        3.51 MiB  (920,960 f32)
+  weights (disk)    58.00 MiB
+
+Weights + peak RAM (fp32 vs int8, group_size 32):
+                      fp32         int8
+  weights          57.95 MiB    16.31 MiB   (3.6× smaller)
+  peak RAM         61.46 MiB    19.82 MiB   (weights + arena)
 ```
 
 ## Parity with llama2.c

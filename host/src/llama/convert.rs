@@ -19,11 +19,11 @@ use std::io::{self, BufWriter, Write};
 use std::path::Path;
 
 use engine::llama::config::{MAGIC, VERSIONED_HEADER_BYTES};
+use engine::llama::{Config, ModelFormat, Weights};
 use engine::quant::quantize;
-use engine::{Config, ModelFormat, Weights};
 
 use crate::error::HostError;
-use crate::loader::{f32_as_bytes, Model};
+use crate::llama::loader::Model;
 
 /// Which format `--convert` should write (`--to`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -125,10 +125,10 @@ fn write_v1(out: &mut impl Write, w: &Weights, c: &Config) -> io::Result<()> {
         w.w2,
         w.w3,
     ] {
-        out.write_all(f32_as_bytes(s))?;
+        out.write_all(bytemuck::cast_slice(s))?;
     }
     if !c.shared_weights {
-        out.write_all(f32_as_bytes(w.wcls))?;
+        out.write_all(bytemuck::cast_slice(w.wcls))?;
     }
     Ok(())
 }
@@ -140,7 +140,7 @@ fn write_v1(out: &mut impl Write, w: &Weights, c: &Config) -> io::Result<()> {
 fn write_v2(out: &mut impl Write, w: &Weights, c: &Config, group_size: usize) -> io::Result<()> {
     out.write_all(&header(c, 2, Some(group_size as i32)))?;
     for s in [w.rms_att, w.rms_ffn, w.rms_final] {
-        out.write_all(f32_as_bytes(s))?;
+        out.write_all(bytemuck::cast_slice(s))?;
     }
 
     // Quantize-and-write one tensor: int8 data, then its f32 scales. Scratch
@@ -152,7 +152,7 @@ fn write_v2(out: &mut impl Write, w: &Weights, c: &Config, group_size: usize) ->
         quantize(&mut qd, &mut qs, tensor, group_size);
         let bytes: Vec<u8> = qd.iter().map(|&v| v as u8).collect();
         out.write_all(&bytes)?;
-        out.write_all(f32_as_bytes(&qs))
+        out.write_all(bytemuck::cast_slice(&qs))
     };
 
     emit(w.token_embedding)?;

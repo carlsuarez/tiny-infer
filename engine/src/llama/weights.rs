@@ -26,8 +26,8 @@
 //! | `freq_cis_real`/`imag` *(legacy only, skipped — RoPE is computed live)* | — | `seq_len * head_size/2` × 2 |
 //! | `wcls` *(only if not shared)* | `wcls` *(ditto)* | `vocab * dim`     |
 
-use crate::llama::config::{Config, ModelFormat};
 use crate::error::EngineError;
+use crate::llama::config::{Config, ModelFormat};
 
 /// Number of `f32` elements a **legacy** checkpoint stores after the header —
 /// including the two skipped `freq_cis` tables, and the separate classifier
@@ -308,8 +308,7 @@ mod tests {
         // fp32 norms: rms_att 8 + rms_ffn 8 + rms_final 4 = 20 floats.
         // int8 data: every quantized weight, 1 byte each; scales: one f32 per group.
         let data = crate::llama::quantize::quantized_weight_count(&c);
-        let expect =
-            crate::llama::config::VERSIONED_HEADER_BYTES + 20 * 4 + data + (data / gs) * 4;
+        let expect = crate::llama::config::VERSIONED_HEADER_BYTES + 20 * 4 + data + (data / gs) * 4;
         assert_eq!(
             expected_file_bytes(&c, ModelFormat::V2 { group_size: gs }),
             expect
@@ -346,7 +345,10 @@ mod tests {
         let buf: std::vec::Vec<f32> = (0..weight_floats_v1(&c)).map(|i| i as f32).collect();
         let w = Weights::new_v1(&buf, &c).unwrap();
         assert_eq!(w.wcls.len(), c.vocab_size * c.dim);
-        assert_eq!(w.wcls[0], (weight_floats_v1(&c) - c.vocab_size * c.dim) as f32);
+        assert_eq!(
+            w.wcls[0],
+            (weight_floats_v1(&c) - c.vocab_size * c.dim) as f32
+        );
     }
 
     #[test]

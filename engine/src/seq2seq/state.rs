@@ -1,6 +1,6 @@
 //! Working buffers for a seq2seq translation, carved from the [`Arena`] once.
 //!
-//! [`Seq2SeqState`] is the encoder-decoder counterpart of the Llama path's
+//! [`RunState`] is the encoder-decoder counterpart of the Llama path's
 //! [`RunState`](crate::llama::state::RunState): every buffer the encoder and decoder
 //! forward passes read or write is allocated up front from a single
 //! caller-provided [`Arena`], so the passes themselves allocate nothing. The
@@ -23,16 +23,16 @@
 
 use crate::arena::Arena;
 use crate::error::EngineError;
-use crate::seq2seq::config::Seq2SeqConfig;
+use crate::seq2seq::config::Config;
 
 /// Every mutable buffer the encoder and decoder forward passes use.
 ///
 /// Each field borrows a disjoint sub-slice of one arena block (`'buf`); as with
 /// [`RunState`](crate::llama::state::RunState), [`Arena::alloc`] ties the slices to the
 /// block's lifetime, not the arena borrow, so they coexist. Buffer sizes come
-/// straight from [`Seq2SeqConfig`] and the source/target lengths.
+/// straight from [`Config`] and the source/target lengths.
 #[derive(Debug)]
-pub struct Seq2SeqState<'buf> {
+pub struct RunState<'buf> {
     // --- encoder buffers (all-to-all attention ⇒ all source positions resident) ---
     /// Encoder residual stream; after the last layer this *is* the encoder
     /// output (the decoder's cross-attention reads it), `[src_len * d]`.
@@ -77,7 +77,7 @@ pub struct Seq2SeqState<'buf> {
     pub logits: &'buf mut [f32],
 }
 
-impl<'buf> Seq2SeqState<'buf> {
+impl<'buf> RunState<'buf> {
     /// Carve every buffer out of `arena` for a translation of up to `src_len`
     /// source and `tgt_len` target tokens.
     ///
@@ -88,10 +88,10 @@ impl<'buf> Seq2SeqState<'buf> {
     /// decoder caches become empty slices).
     pub fn new(
         arena: &mut Arena<'buf>,
-        c: &Seq2SeqConfig,
+        c: &Config,
         src_len: usize,
         tgt_len: usize,
-    ) -> Result<Seq2SeqState<'buf>, EngineError> {
+    ) -> Result<RunState<'buf>, EngineError> {
         let d = c.d_model;
         // `Ord::max` is not const-friendly elsewhere in the budget, so mirror its
         // hand-rolled form here for the two values that drive the step scratch.
@@ -102,7 +102,7 @@ impl<'buf> Seq2SeqState<'buf> {
         };
         let span = if src_len > tgt_len { src_len } else { tgt_len };
 
-        Ok(Seq2SeqState {
+        Ok(RunState {
             enc_x: arena.alloc(src_len * d)?,
             enc_sub: arena.alloc(src_len * d)?,
             enc_k: arena.alloc(src_len * d)?,
@@ -135,8 +135,8 @@ mod tests {
     extern crate std;
     use std::vec;
 
-    fn tiny_config() -> Seq2SeqConfig {
-        Seq2SeqConfig {
+    fn tiny_config() -> Config {
+        Config {
             d_model: 4,
             enc_layers: 1,
             dec_layers: 2,
@@ -162,7 +162,7 @@ mod tests {
         let (src, tgt) = (6, 5);
         let mut buf = vec![0.0f32; seq2seq_arena_floats(&c, src, tgt)];
         let mut arena = Arena::new(&mut buf);
-        let s = Seq2SeqState::new(&mut arena, &c, src, tgt).unwrap();
+        let s = RunState::new(&mut arena, &c, src, tgt).unwrap();
 
         let d = c.d_model;
         assert_eq!(s.enc_x.len(), src * d);
@@ -190,7 +190,7 @@ mod tests {
         let total = seq2seq_arena_floats(&c, src, tgt);
         let mut buf = vec![0.0f32; total];
         let mut arena = Arena::new(&mut buf);
-        let _s = Seq2SeqState::new(&mut arena, &c, src, tgt).unwrap();
+        let _s = RunState::new(&mut arena, &c, src, tgt).unwrap();
         // The budget is exact: nothing left over, nothing short.
         assert_eq!(arena.used(), total);
         assert_eq!(arena.remaining(), 0);
@@ -204,7 +204,7 @@ mod tests {
         let src = 6;
         let mut buf = vec![0.0f32; seq2seq_arena_floats(&c, src, 0)];
         let mut arena = Arena::new(&mut buf);
-        let s = Seq2SeqState::new(&mut arena, &c, src, 0).unwrap();
+        let s = RunState::new(&mut arena, &c, src, 0).unwrap();
         assert!(s.self_k.is_empty());
         assert!(s.self_v.is_empty());
         assert_eq!(s.cross_k.len(), c.dec_layers * src * c.d_model);
@@ -217,7 +217,7 @@ mod tests {
         let mut buf = vec![0.0f32; seq2seq_arena_floats(&c, src, tgt) - 1];
         let mut arena = Arena::new(&mut buf);
         assert!(matches!(
-            Seq2SeqState::new(&mut arena, &c, src, tgt),
+            RunState::new(&mut arena, &c, src, tgt),
             Err(EngineError::ArenaOverflow { .. })
         ));
     }

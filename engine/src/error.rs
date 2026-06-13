@@ -47,7 +47,7 @@ pub enum EngineError {
     InvalidSeq2SeqConfig(Seq2SeqField),
 }
 
-/// Identifies which [`Config`](crate::Config) field failed validation.
+/// Identifies which [`Config`](crate::llama::Config) field failed validation.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum ConfigField {
@@ -71,7 +71,7 @@ pub enum ConfigField {
     GroupSize,
 }
 
-/// Identifies which [`Seq2SeqConfig`](crate::seq2seq::Seq2SeqConfig) field
+/// Identifies which [`Config`](crate::seq2seq::Config) field
 /// failed validation.
 #[cfg(feature = "seq2seq")]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

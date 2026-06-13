@@ -41,7 +41,8 @@ mod firmware {
 
     use engine::llama::memory::{arena_floats, MemoryBudget};
     use engine::llama::weights::weight_floats;
-    use engine::{forward, math, Arena, Config, Kernel, ModelWeights, RunState, Weights};
+    use engine::llama::{forward, Config, Kernel, ModelWeights, RunState, Weights};
+    use engine::{math, Arena};
 
     /// A tiny synthetic model. Small enough that every buffer fits comfortably on the
     /// stack, so the whole forward pass runs with no allocator at all.

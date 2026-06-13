@@ -2,8 +2,9 @@
 """Export a Hugging Face MarianMTModel (OPUS-MT) to tiny-infer's seq2seq format.
 
 Writes `<out>/model.bin` — the binary the Rust engine loads — plus the model's
-SentencePiece tokenizer artifacts (source.spm / target.spm / vocab.json) into the
-same directory for the upcoming tokenizer milestone.
+SentencePiece tokenizer artifacts (source.spm / target.spm / vocab.json) and the
+host-readable `tokenizer.bin` (built via dump_tokenizer.py) into the same directory,
+so the export can translate immediately.
 
 Usage:
     python scripts/export_marian.py Helsinki-NLP/opus-mt-en-fr -o models/opus-mt-en-fr
@@ -233,6 +234,11 @@ def main() -> None:
 
     tok = AutoTokenizer.from_pretrained(args.model)
     tok.save_pretrained(outdir)
+    # Build the host-readable tokenizer.bin from the SentencePiece source model +
+    # shared vocab we just saved (so a fresh export can translate immediately).
+    import dump_tokenizer
+
+    dump_tokenizer.build(outdir)
 
     print(f"wrote {bin_path} ({size / 2**20:.1f} MiB, {n_floats:,} fp32)")
     print(

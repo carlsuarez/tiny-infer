@@ -18,12 +18,13 @@
 //!
 //! The fp32 views borrow `&[f32]` out of the file buffer, so it must be 4-byte
 //! aligned. A `Vec<u8>` only guarantees alignment 1, so the file is read directly
-//! into a `Vec<f32>` (4-aligned by construction) via a byte view of its storage.
-//! That keeps the load to a single read with no extra copy, and confines the only
-//! `unsafe` to one audited cast (`f32` ↔ `u8`, always sound — `u8` has alignment
-//! 1). Every supported format is 4-byte–granular: headers are 28 or 256 bytes,
-//! fp32 payloads trivially, and v2 payloads because every tensor's weight count is
-//! a multiple of `dim` (a multiple of 4 for any real model).
+//! into a `Vec<f32>` (4-aligned by construction) through a byte view of its storage
+//! obtained with [`bytemuck::cast_slice_mut`]. That keeps the load to a single read
+//! with no extra copy, and the `f32` ↔ `u8` reinterpretation is a *safe* `bytemuck`
+//! cast (always sound — `u8` has alignment 1), so the host needs no `unsafe` of its
+//! own. Every supported format is 4-byte–granular: headers are 28 or 256 bytes, fp32
+//! payloads trivially, and v2 payloads because every tensor's weight count is a
+//! multiple of `dim` (a multiple of 4 for any real model).
 
 use std::fs::File;
 use std::io::Read;
@@ -32,7 +33,7 @@ use std::path::{Path, PathBuf};
 use engine::llama::config::VERSIONED_HEADER_BYTES;
 use engine::llama::quantize::{quantized_scale_count, quantized_weight_count, v2_tensor_sizes};
 use engine::llama::weights::expected_file_bytes;
-use engine::{parse_header, Config, ModelFormat, Weights};
+use engine::llama::{parse_header, Config, ModelFormat, Weights};
 
 use crate::error::HostError;
 
@@ -89,12 +90,12 @@ impl Model {
 
         // Read the whole file into a 4-aligned f32 buffer in one pass.
         let mut data = vec![0.0f32; n_floats];
-        file.read_exact(f32_as_bytes_mut(&mut data))
+        file.read_exact(bytemuck::cast_slice_mut(&mut data))
             .map_err(|e| HostError::io(path, e))?;
 
         // Detect the format and parse + validate the config.
         let (config, format) =
-            parse_header(f32_as_bytes(&data)).map_err(|e| HostError::engine(path, e))?;
+            parse_header(bytemuck::cast_slice(&data)).map_err(|e| HostError::engine(path, e))?;
 
         let expected = expected_file_bytes(&config, format);
         let file_bytes = len as usize;
@@ -169,7 +170,7 @@ impl Model {
 
         // Walk the interleaved tensors byte-wise (int8 data is unaligned by
         // nature; scales are decoded with `from_le_bytes`, which needs none).
-        let bytes = f32_as_bytes(&self.data);
+        let bytes: &[u8] = bytemuck::cast_slice(&self.data);
         let mut off = VERSIONED_HEADER_BYTES + (2 * l * dim + dim) * 4;
         let mut data = Vec::with_capacity(quantized_weight_count(c));
         let mut scales = Vec::with_capacity(quantized_scale_count(c, group_size));
@@ -206,21 +207,4 @@ impl Model {
     pub fn path(&self) -> &Path {
         &self.path
     }
-}
-
-/// Reinterpret an `&[f32]` as raw bytes. Sound: `u8` has alignment 1, and every
-/// bit pattern of `f32` is a valid `u8`.
-pub(crate) fn f32_as_bytes(floats: &[f32]) -> &[u8] {
-    // SAFETY: `floats` is valid for `len*4` bytes; `u8` has no alignment or
-    // validity requirements that `f32` storage does not already satisfy.
-    unsafe {
-        std::slice::from_raw_parts(floats.as_ptr() as *const u8, std::mem::size_of_val(floats))
-    }
-}
-
-/// Mutable counterpart of [`f32_as_bytes`], used to read the file in place.
-pub(crate) fn f32_as_bytes_mut(floats: &mut [f32]) -> &mut [u8] {
-    let len = std::mem::size_of_val(floats);
-    // SAFETY: exclusive access to `floats`; same reasoning as `f32_as_bytes`.
-    unsafe { std::slice::from_raw_parts_mut(floats.as_mut_ptr() as *mut u8, len) }
 }

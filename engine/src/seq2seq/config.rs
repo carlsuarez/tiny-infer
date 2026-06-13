@@ -73,9 +73,9 @@ pub enum Activation {
 /// The encoder and decoder stacks share `d_model` and the vocabulary (one
 /// embedding table serves the encoder input, the decoder input, and the tied
 /// lm_head) but may differ in depth, head count, and feed-forward width.
-/// Construct via [`Seq2SeqConfig::parse`].
+/// Construct via [`Config::parse`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct Seq2SeqConfig {
+pub struct Config {
     /// Embedding/residual-stream width, shared by both stacks.
     pub d_model: usize,
     /// Number of encoder layers.
@@ -97,7 +97,7 @@ pub struct Seq2SeqConfig {
     /// Maximum target-sequence length the checkpoint supports.
     pub max_tgt: usize,
     /// Padding token id. Marian also uses it as the decoder start token
-    /// (see [`Seq2SeqConfig::decoder_start_id`]).
+    /// (see [`Config::decoder_start_id`]).
     pub pad_id: usize,
     /// End-of-sequence token id (stops greedy decoding).
     pub eos_id: usize,
@@ -113,7 +113,7 @@ pub struct Seq2SeqConfig {
     pub scale_embedding: bool,
 }
 
-impl Seq2SeqConfig {
+impl Config {
     /// Parse and validate a seq2seq header from the start of a checkpoint's
     /// bytes.
     ///
@@ -123,7 +123,7 @@ impl Seq2SeqConfig {
     /// back to other formats), [`EngineError::HeaderTooShort`] /
     /// [`EngineError::UnsupportedVersion`] for a damaged or newer file, and
     /// [`EngineError::InvalidSeq2SeqConfig`] if a field is unusable.
-    pub fn parse(bytes: &[u8]) -> Result<Seq2SeqConfig, EngineError> {
+    pub fn parse(bytes: &[u8]) -> Result<Config, EngineError> {
         if bytes.len() < 4 {
             return Err(EngineError::HeaderTooShort);
         }
@@ -190,7 +190,7 @@ impl Seq2SeqConfig {
         };
         let scale_embedding = bytes[62] != 0;
 
-        Ok(Seq2SeqConfig {
+        Ok(Config {
             d_model,
             enc_layers,
             dec_layers,
@@ -256,7 +256,7 @@ mod tests {
     #[test]
     fn parses_opus_mt_shaped_header() {
         let bytes = header(OPUS_EN_FR, OPUS_FLAGS);
-        let c = Seq2SeqConfig::parse(&bytes).unwrap();
+        let c = Config::parse(&bytes).unwrap();
         assert_eq!(c.d_model, 512);
         assert_eq!(c.enc_layers, 6);
         assert_eq!(c.dec_layers, 6);
@@ -282,7 +282,7 @@ mod tests {
     #[test]
     fn parses_pre_norm_gelu_flags() {
         let bytes = header(OPUS_EN_FR, [1, 0, 0]);
-        let c = Seq2SeqConfig::parse(&bytes).unwrap();
+        let c = Config::parse(&bytes).unwrap();
         assert!(c.norm_before);
         assert_eq!(c.activation, Activation::Gelu);
         assert!(!c.scale_embedding);
@@ -293,10 +293,7 @@ mod tests {
         // A llama2.c versioned header must not parse as seq2seq.
         let mut bytes = header(OPUS_EN_FR, OPUS_FLAGS);
         bytes[0..4].copy_from_slice(&crate::llama::config::MAGIC.to_le_bytes());
-        assert_eq!(
-            Seq2SeqConfig::parse(&bytes).unwrap_err(),
-            EngineError::NotSeq2Seq
-        );
+        assert_eq!(Config::parse(&bytes).unwrap_err(), EngineError::NotSeq2Seq);
         assert!(!is_seq2seq(&bytes));
         assert!(is_seq2seq(&header(OPUS_EN_FR, OPUS_FLAGS)));
     }
@@ -305,13 +302,13 @@ mod tests {
     fn rejects_short_header() {
         // Too short to even check the magic.
         assert_eq!(
-            Seq2SeqConfig::parse(&[0u8; 3]).unwrap_err(),
+            Config::parse(&[0u8; 3]).unwrap_err(),
             EngineError::HeaderTooShort
         );
         // Magic present but the header is truncated.
         let bytes = header(OPUS_EN_FR, OPUS_FLAGS);
         assert_eq!(
-            Seq2SeqConfig::parse(&bytes[..200]).unwrap_err(),
+            Config::parse(&bytes[..200]).unwrap_err(),
             EngineError::HeaderTooShort
         );
     }
@@ -321,7 +318,7 @@ mod tests {
         let mut bytes = header(OPUS_EN_FR, OPUS_FLAGS);
         bytes[4..8].copy_from_slice(&2i32.to_le_bytes());
         assert_eq!(
-            Seq2SeqConfig::parse(&bytes).unwrap_err(),
+            Config::parse(&bytes).unwrap_err(),
             EngineError::UnsupportedVersion { version: 2 }
         );
     }
@@ -331,13 +328,13 @@ mod tests {
         let mut fields = OPUS_EN_FR;
         fields[0] = 0; // d_model
         assert_eq!(
-            Seq2SeqConfig::parse(&header(fields, OPUS_FLAGS)).unwrap_err(),
+            Config::parse(&header(fields, OPUS_FLAGS)).unwrap_err(),
             EngineError::InvalidSeq2SeqConfig(Seq2SeqField::DModel)
         );
         let mut fields = OPUS_EN_FR;
         fields[6] = -1; // dec_ffn
         assert_eq!(
-            Seq2SeqConfig::parse(&header(fields, OPUS_FLAGS)).unwrap_err(),
+            Config::parse(&header(fields, OPUS_FLAGS)).unwrap_err(),
             EngineError::InvalidSeq2SeqConfig(Seq2SeqField::DecFfn)
         );
     }
@@ -347,13 +344,13 @@ mod tests {
         let mut fields = OPUS_EN_FR;
         fields[3] = 7; // enc_heads: 512 % 7 != 0
         assert_eq!(
-            Seq2SeqConfig::parse(&header(fields, OPUS_FLAGS)).unwrap_err(),
+            Config::parse(&header(fields, OPUS_FLAGS)).unwrap_err(),
             EngineError::InvalidSeq2SeqConfig(Seq2SeqField::EncHeads)
         );
         let mut fields = OPUS_EN_FR;
         fields[4] = 6; // dec_heads: 512 % 6 != 0
         assert_eq!(
-            Seq2SeqConfig::parse(&header(fields, OPUS_FLAGS)).unwrap_err(),
+            Config::parse(&header(fields, OPUS_FLAGS)).unwrap_err(),
             EngineError::InvalidSeq2SeqConfig(Seq2SeqField::DecHeads)
         );
     }
@@ -363,13 +360,13 @@ mod tests {
         let mut fields = OPUS_EN_FR;
         fields[10] = 59514; // pad_id == vocab_size: one past the end
         assert_eq!(
-            Seq2SeqConfig::parse(&header(fields, OPUS_FLAGS)).unwrap_err(),
+            Config::parse(&header(fields, OPUS_FLAGS)).unwrap_err(),
             EngineError::InvalidSeq2SeqConfig(Seq2SeqField::PadId)
         );
         let mut fields = OPUS_EN_FR;
         fields[12] = -1; // bos_id negative
         assert_eq!(
-            Seq2SeqConfig::parse(&header(fields, OPUS_FLAGS)).unwrap_err(),
+            Config::parse(&header(fields, OPUS_FLAGS)).unwrap_err(),
             EngineError::InvalidSeq2SeqConfig(Seq2SeqField::BosId)
         );
     }
@@ -378,7 +375,7 @@ mod tests {
     fn rejects_unknown_activation_byte() {
         let bytes = header(OPUS_EN_FR, [0, 2, 1]);
         assert_eq!(
-            Seq2SeqConfig::parse(&bytes).unwrap_err(),
+            Config::parse(&bytes).unwrap_err(),
             EngineError::InvalidSeq2SeqConfig(Seq2SeqField::Activation)
         );
     }

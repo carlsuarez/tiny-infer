@@ -12,11 +12,12 @@
 //! kernels are the readable reference; the SIMD kernels widen the inner dot product
 //! to 8 lanes of `f32` and fall back to scalar for any tail that does not fill a lane.
 //! The fp32 pair agree up to floating-point reassociation; the int8 pair agree
-//! **exactly** (integer accumulation is associative). The caller
-//! ([`crate::ModelWeights::matmul`]) picks which via [`crate::Kernel`].
+//! **exactly** (integer accumulation is associative). The caller picks which via
+//! [`Kernel`], the architecture-agnostic kernel selector both forward passes thread
+//! through.
 //!
 //! The int8 matmul additionally has a hardware **dot-product** kernel, selected by
-//! [`Kernel::Dotprod`](crate::Kernel): x86 AVX-512 VNNI (`vpdpbusd`) and ARM NEON
+//! [`Kernel::Dotprod`]: x86 AVX-512 VNNI (`vpdpbusd`) and ARM NEON
 //! `sdot`, both [`matmul_q8_dotprod`] (one per `cfg(target_arch)`). They run the same
 //! exact integer dot product as the scalar kernel, just far faster, and the std host
 //! only selects them after detecting the CPU feature at runtime.
@@ -27,7 +28,30 @@
 //!
 //! [`Arena`]: crate::Arena
 
-use crate::quant::QuantizedTensor;
+use crate::quant::{quantize_activation, QuantScratch, QuantizedTensor};
+
+/// Which matmul implementation a forward pass should use.
+///
+/// Architecture-agnostic and orthogonal to the weight representation: every matmul
+/// has a scalar reference kernel and a `core::simd` kernel ([`matmul`]/[`matmul_simd`]
+/// for fp32, [`matmul_q8`]/[`matmul_q8_simd`] for int8), and the int8 path also has a
+/// hardware dot-product kernel. Both the Llama and seq2seq forward passes thread a
+/// `Kernel` through and dispatch their matmuls on it. The choice does not change token
+/// output beyond fp32 rounding noise; it is a speed/reference knob.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Kernel {
+    /// Straightforward scalar kernels — the readable reference path.
+    Scalar,
+    /// Vectorized `core::simd` kernels (8-wide `f32` lanes).
+    Simd,
+    /// Hardware int8 **dot-product** kernel ([`matmul_q8_dotprod`]) for the int8 path —
+    /// x86 AVX-512 **VNNI** or ARM NEON **`sdot`**. The fp32 path always falls back to
+    /// [`Kernel::Simd`], as does the x86 kernel for any group size not a multiple of 32;
+    /// the ARM kernel handles any group size. Targets with neither instruction fall back
+    /// to SIMD entirely. The std host only selects this after detecting the CPU feature
+    /// at runtime.
+    Dotprod,
+}
 use core::simd::num::{SimdFloat, SimdInt};
 use core::simd::{f32x8, i32x8, i8x8};
 
@@ -55,7 +79,7 @@ const SDOT_LANES: usize = 16;
 /// in the checkpoint uses, so no transpose is ever needed.
 ///
 /// This is the readable reference implementation; [`matmul_simd`] computes the same
-/// product with `core::simd` and is selected on the hot path via [`crate::Kernel`].
+/// product with `core::simd` and is selected on the hot path via [`crate::llama::Kernel`].
 ///
 /// # Panics
 /// In debug builds, if the slice lengths disagree with `d_in`/`d_out`.
@@ -113,7 +137,7 @@ pub fn matmul_simd(out: &mut [f32], x: &[f32], w: &[f32], d_in: usize, d_out: us
 /// Full int8 (**W8A8**) matrix–vector product `out = W · x` (scalar).
 ///
 /// Both operands are int8: `qw` is the group-wise quantized weight, and the activation
-/// is pre-quantized by [`quantize_activation`](crate::quant::quantize_activation)
+/// is pre-quantized by [`quantize_activation`]
 /// into `xq` (integer-valued `f32`, range `−127..=127`) with one scale per group in
 /// `x_scales`. Within each group the dot product is accumulated in **`i32`** (exact —
 /// no float rounding), then the integer sum is scaled by `w_scale · x_scale` and folded
@@ -228,7 +252,7 @@ pub fn matmul_q8_simd(
 /// *unsigned* × *signed* bytes, so each weight is offset by `+128` in-register (mapping
 /// the stored `i8` to the `u8` the instruction wants) and the per-group correction
 /// `128 · Σ(activations)` — precomputed in `x_gsums` by
-/// [`quantize_activation`](crate::quant::quantize_activation) — is subtracted back
+/// [`quantize_activation`] — is subtracted back
 /// out: `Σ wₖaₖ = Σ(wₖ+128)aₖ − 128·Σaₖ`. The integer dot product is exact, so this is
 /// **bit-identical** to the scalar [`matmul_q8`].
 ///
@@ -238,7 +262,7 @@ pub fn matmul_q8_simd(
 ///
 /// # Safety
 /// The CPU must support `avx2`, `avx512vl`, and `avx512vnni`. The std host verifies this
-/// with `is_x86_feature_detected!` before selecting [`Kernel::Dotprod`](crate::Kernel);
+/// with `is_x86_feature_detected!` before selecting [`Kernel::Dotprod`](crate::llama::Kernel);
 /// any other caller must guarantee it.
 ///
 /// # Panics
@@ -319,7 +343,7 @@ pub unsafe fn matmul_q8_dotprod(
 /// # Safety
 /// The CPU must support the NEON `dotprod` feature. The std host verifies this with
 /// `is_aarch64_feature_detected!("dotprod")` before selecting
-/// [`Kernel::Dotprod`](crate::Kernel); any other caller must guarantee it.
+/// [`Kernel::Dotprod`](crate::llama::Kernel); any other caller must guarantee it.
 ///
 /// # Panics
 /// In debug builds, if the slice lengths disagree with `d_in`/`d_out`/`group_size`.
@@ -372,6 +396,93 @@ pub unsafe fn matmul_q8_dotprod(
             total += ival as f32 * qw.scales[i * groups_per_row + g] * x_scale;
         }
         *o = total;
+    }
+}
+
+/// One full int8 (**W8A8**) projection `out = W · x` over an fp32 activation `x`.
+///
+/// The single entry point both architectures use for a quantized matmul: it quantizes the
+/// fp32 activation `x` into the caller-owned [`QuantScratch`] (int8 values + per-group
+/// scales + the per-group sums the VNNI correction needs) with
+/// [`quantize_activation`], then runs the integer dot product against the int8 weights
+/// `wl` (a single projection's `[d_out, d_in]` matrix — slice a layer with
+/// [`QuantizedTensor::layer`] first) on the kernel `kernel` selects:
+///
+/// * [`Kernel::Scalar`] → [`matmul_q8`] (readable reference);
+/// * [`Kernel::Simd`] → [`matmul_q8_simd`] (portable `core::simd`);
+/// * [`Kernel::Dotprod`] → the hardware dot-product kernel (x86 VNNI / ARM `sdot`), which
+///   itself falls back to SIMD on group sizes / targets it cannot serve.
+///
+/// All three produce the same answer (the int8 kernels agree exactly; only the fp32 output
+/// fold rounds), so `kernel` is a pure speed/reference knob. The `[..d_in]` / `[..groups]`
+/// prefixes of the scratch are filled and read, so one scratch sized for the largest
+/// projection serves every matmul.
+///
+/// # Panics
+/// In debug builds, via the kernels' length assertions, or if the scratch buffers are
+/// shorter than `d_in` / `d_in / group_size`.
+pub fn matmul_w8a8(
+    kernel: Kernel,
+    out: &mut [f32],
+    x: &[f32],
+    wl: &QuantizedTensor,
+    d_in: usize,
+    d_out: usize,
+    qs: &mut QuantScratch,
+) {
+    let gs = wl.group_size;
+    let groups = d_in / gs;
+    let xqd = &mut qs.xq[..d_in];
+    let xqs = &mut qs.scales[..groups];
+    let xqg = &mut qs.gsums[..groups];
+    quantize_activation(xqd, xqs, xqg, x, gs);
+    match kernel {
+        Kernel::Scalar => matmul_q8(out, xqd, xqs, wl, d_in, d_out),
+        Kernel::Simd => matmul_q8_simd(out, xqd, xqs, wl, d_in, d_out),
+        Kernel::Dotprod => dispatch_q8_dotprod(out, xqd, xqs, xqg, wl, d_in, d_out),
+    }
+}
+
+/// Dispatch the int8 matmul to a hardware dot-product kernel when one applies, else the
+/// portable SIMD kernel. The two hardware kernels differ in shape, so this is the single
+/// place that reconciles them:
+///
+/// * **x86 AVX-512 VNNI** (`vpdpbusd`): unsigned×signed, so it consumes the per-group
+///   `xq_gsums` correction and needs a `group_size` that is a multiple of 32 — other
+///   sizes fall through to SIMD.
+/// * **ARM NEON `sdot`**: signed×signed, so it ignores `xq_gsums` entirely and its scalar
+///   tail covers any `group_size`.
+/// * **Everything else** (and the `thumbv7em` embedded build): portable SIMD.
+fn dispatch_q8_dotprod(
+    out: &mut [f32],
+    xq: &[i8],
+    xq_scales: &[f32],
+    xq_gsums: &[f32],
+    wl: &QuantizedTensor,
+    d_in: usize,
+    d_out: usize,
+) {
+    #[cfg(target_arch = "x86_64")]
+    if wl.group_size.is_multiple_of(32) {
+        // SAFETY: the std host only selects `Kernel::Dotprod` after detecting avx2 +
+        // avx512vl + avx512vnni at runtime; the group-size precondition is checked here.
+        unsafe { matmul_q8_dotprod(out, xq, xq_scales, xq_gsums, wl, d_in, d_out) };
+        return;
+    }
+
+    #[cfg(target_arch = "aarch64")]
+    {
+        let _ = xq_gsums; // sdot is signed×signed — no +128 correction needed
+                          // SAFETY: the std host only selects `Kernel::Dotprod` after detecting the NEON
+                          // `dotprod` feature at runtime.
+        unsafe { matmul_q8_dotprod(out, xq, xq_scales, wl, d_in, d_out) };
+    }
+
+    // SIMD fallback for non-aarch64 targets (and x86 group sizes VNNI can't take above).
+    #[cfg(not(target_arch = "aarch64"))]
+    {
+        let _ = xq_gsums; // unused by the portable fallback
+        matmul_q8_simd(out, xq, xq_scales, wl, d_in, d_out);
     }
 }
 

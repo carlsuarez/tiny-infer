@@ -14,10 +14,10 @@
 
 use crate::llama::config::Config;
 use crate::llama::quantize::QuantizedWeights;
-use crate::llama::state::{QuantScratch, RunState};
+use crate::llama::state::RunState;
 use crate::llama::weights::Weights;
-use crate::math;
-use crate::quant::QuantizedTensor;
+use crate::math::{self, Kernel};
+use crate::quant::{QuantScratch, QuantizedTensor};
 
 /// Which projection weight a [`ModelWeights::matmul`] call should apply.
 ///
@@ -53,29 +53,6 @@ impl Proj {
             Proj::Wcls => (c.dim, c.vocab_size),
         }
     }
-}
-
-/// Which matmul implementation the forward pass should use.
-///
-/// Orthogonal to the weight representation ([`ModelWeights`]): each of the two
-/// representations has a scalar reference kernel and a `core::simd` kernel, so the
-/// full set is fp32 (`matmul`/`matmul_simd`) × int8 (`matmul_q8`/`matmul_q8_simd`).
-/// [`ModelWeights::matmul`] resolves the `(representation, kernel)` pair to one of the
-/// four. The choice does not affect token output beyond fp32 rounding noise; it is a
-/// speed/reference knob threaded through [`forward`].
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum Kernel {
-    /// Straightforward scalar kernels — the readable reference path.
-    Scalar,
-    /// Vectorized `core::simd` kernels (8-wide `f32` lanes).
-    Simd,
-    /// Hardware int8 **dot-product** kernel ([`math::matmul_q8_dotprod`]) for the `Q8`
-    /// path — x86 AVX-512 **VNNI** or ARM NEON **`sdot`**. The fp32 path always falls
-    /// back to [`Kernel::Simd`], as does the x86 kernel for any group size not a multiple
-    /// of 32; the ARM kernel handles any group size. Targets with neither instruction
-    /// fall back to SIMD entirely. The std host only selects this after detecting the CPU
-    /// feature at runtime.
-    Dotprod,
 }
 
 /// A model's weights in either representation, so a single [`forward`] serves both.
@@ -144,8 +121,7 @@ impl<'a> ModelWeights<'a> {
     /// caller-provided [`QuantScratch`] and the matmul runs in integer arithmetic. `qs`
     /// must be `Some` for `Q8` weights; the fp32 path ignores it (pass `None`).
     // The projection (`p`/`l`), the I/O buffers (`out`/`x`), the config, and the two
-    // runtime knobs (`kernel`, `qs`) are all load-bearing — this is the dispatch seam, so
-    // a parameter just over clippy's heuristic threshold is expected here.
+    // runtime knobs (`kernel`, `qs`) are all load-bearing
     #[allow(clippy::too_many_arguments)]
     fn matmul(
         &self,
@@ -169,22 +145,12 @@ impl<'a> ModelWeights<'a> {
                 }
             }
             ModelWeights::Q8(w) => {
+                // W8A8: the shared helper quantizes this matmul's activation to int8 and
+                // runs the integer dot product (scalar / SIMD / hardware dot-product) against
+                // the int8 weights.
                 let wl = q8_proj(w, p).layer(l, d_out, d_in);
-                // Quantize this matmul's activation to int8 once (values + per-group
-                // scales + per-group sums for the VNNI correction), then run the
-                // integer dot product against the int8 weights.
                 let qs = qs.expect("the Q8 forward path requires a QuantScratch");
-                let gs = wl.group_size;
-                let groups = d_in / gs;
-                let xqd = &mut qs.xq[..d_in];
-                let xqs = &mut qs.scales[..groups];
-                let xqg = &mut qs.gsums[..groups];
-                crate::quant::quantize_activation(xqd, xqs, xqg, x, gs);
-                match kernel {
-                    Kernel::Scalar => math::matmul_q8(out, xqd, xqs, &wl, d_in, d_out),
-                    Kernel::Simd => math::matmul_q8_simd(out, xqd, xqs, &wl, d_in, d_out),
-                    Kernel::Dotprod => dotprod_q8(out, xqd, xqs, xqg, &wl, d_in, d_out),
-                }
+                math::matmul_w8a8(kernel, out, x, &wl, d_in, d_out, qs);
             }
         }
     }
@@ -215,49 +181,6 @@ fn q8_proj<'a>(w: &QuantizedWeights<'a>, p: Proj) -> QuantizedTensor<'a> {
         Proj::W2 => w.w2,
         Proj::W3 => w.w3,
         Proj::Wcls => w.wcls,
-    }
-}
-
-/// Dispatch the int8 matmul to a hardware dot-product kernel when one applies, else the
-/// portable SIMD kernel. The two hardware kernels differ in shape, so this is the single
-/// place that reconciles them:
-///
-/// * **x86 AVX-512 VNNI** (`vpdpbusd`): unsigned×signed, so it consumes the per-group
-///   `xq_gsums` correction and needs a `group_size` that is a multiple of 32 — other
-///   sizes fall through to SIMD.
-/// * **ARM NEON `sdot`**: signed×signed, so it ignores `xq_gsums` entirely and its scalar
-///   tail covers any `group_size`.
-/// * **Everything else** (and the `thumbv7em` embedded build): portable SIMD.
-fn dotprod_q8(
-    out: &mut [f32],
-    xq: &[i8],
-    xq_scales: &[f32],
-    xq_gsums: &[f32],
-    wl: &QuantizedTensor,
-    d_in: usize,
-    d_out: usize,
-) {
-    #[cfg(target_arch = "x86_64")]
-    if wl.group_size.is_multiple_of(32) {
-        // SAFETY: the std host only selects `Kernel::Dotprod` after detecting avx2 +
-        // avx512vl + avx512vnni at runtime; the group-size precondition is checked here.
-        unsafe { math::matmul_q8_dotprod(out, xq, xq_scales, xq_gsums, wl, d_in, d_out) };
-        return;
-    }
-
-    #[cfg(target_arch = "aarch64")]
-    {
-        let _ = xq_gsums; // sdot is signed×signed — no +128 correction needed
-        // SAFETY: the std host only selects `Kernel::Dotprod` after detecting the NEON
-        // `dotprod` feature at runtime.
-        unsafe { math::matmul_q8_dotprod(out, xq, xq_scales, wl, d_in, d_out) };
-    }
-
-    // SIMD fallback for non-aarch64 targets (and x86 group sizes VNNI can't take above).
-    #[cfg(not(target_arch = "aarch64"))]
-    {
-        let _ = xq_gsums; // unused by the portable fallback
-        math::matmul_q8_simd(out, xq, xq_scales, wl, d_in, d_out);
     }
 }
 
@@ -467,7 +390,9 @@ mod tests {
     fn forward_q8_tracks_fp32() {
         // Quantizing the eight matmul weights must not change the answer's scale: the
         // int8 logits track the fp32 logits closely for the same input.
-        use crate::llama::quantize::{quantize_weights, quantized_scale_count, quantized_weight_count};
+        use crate::llama::quantize::{
+            quantize_weights, quantized_scale_count, quantized_weight_count,
+        };
 
         let c = tiny_config();
         let wbuf = fake_weights(&c);
@@ -498,7 +423,7 @@ mod tests {
             let mut s = RunState::new(&mut arena, &c).unwrap();
             let n = crate::llama::memory::max_proj_d_in(&c);
             let (mut xq, mut sc, mut gs) = (vec![0i8; n], vec![0.0f32; n], vec![0.0f32; n]);
-            let scratch = QuantScratch::new(&mut xq, &mut sc, &mut gs, &c).unwrap();
+            let scratch = QuantScratch::new(&mut xq, &mut sc, &mut gs, n).unwrap();
             let mut qs = matches!(w, ModelWeights::Q8(_)).then_some(scratch);
             forward(&c, w, &mut s, 3, 0, kernel, &mut qs).to_vec()
         };
@@ -525,7 +450,9 @@ mod tests {
         // The SIMD kernels differ from scalar only by floating-point reassociation,
         // so the full-forward logits must match to within rounding for both the fp32
         // and int8 representations.
-        use crate::llama::quantize::{quantize_weights, quantized_scale_count, quantized_weight_count};
+        use crate::llama::quantize::{
+            quantize_weights, quantized_scale_count, quantized_weight_count,
+        };
 
         let c = tiny_config();
         let wbuf = fake_weights(&c);
@@ -552,7 +479,7 @@ mod tests {
             let mut s = RunState::new(&mut arena, &c).unwrap();
             let n = crate::llama::memory::max_proj_d_in(&c);
             let (mut xq, mut sc, mut gs) = (vec![0i8; n], vec![0.0f32; n], vec![0.0f32; n]);
-            let scratch = QuantScratch::new(&mut xq, &mut sc, &mut gs, &c).unwrap();
+            let scratch = QuantScratch::new(&mut xq, &mut sc, &mut gs, n).unwrap();
             let mut qs = matches!(w, ModelWeights::Q8(_)).then_some(scratch);
             forward(&c, w, &mut s, 3, 0, kernel, &mut qs).to_vec()
         };

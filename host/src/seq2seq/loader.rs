@@ -14,11 +14,9 @@ use std::io::Read;
 use std::path::{Path, PathBuf};
 
 use engine::seq2seq::config::{is_seq2seq, SEQ2SEQ_HEADER_BYTES};
-use engine::seq2seq::{expected_seq2seq_file_bytes, Seq2SeqWeights};
-use engine::Seq2SeqConfig;
+use engine::seq2seq::{expected_file_bytes, Config as Seq2SeqConfig, Weights};
 
 use crate::error::HostError;
-use crate::loader::{f32_as_bytes, f32_as_bytes_mut};
 
 /// Whether the file at `path` opens with the seq2seq magic (`"tis2"`).
 ///
@@ -68,13 +66,13 @@ impl Seq2SeqModel {
 
         // Read the whole file into a 4-aligned f32 buffer in one pass.
         let mut data = vec![0.0f32; n_floats];
-        file.read_exact(f32_as_bytes_mut(&mut data))
+        file.read_exact(bytemuck::cast_slice_mut(&mut data))
             .map_err(|e| HostError::io(path, e))?;
 
         let config =
-            Seq2SeqConfig::parse(f32_as_bytes(&data)).map_err(|e| HostError::engine(path, e))?;
+            Seq2SeqConfig::parse(bytemuck::cast_slice(&data)).map_err(|e| HostError::engine(path, e))?;
 
-        let expected = expected_seq2seq_file_bytes(&config);
+        let expected = expected_file_bytes(&config);
         let file_bytes = len as usize;
         if expected != file_bytes {
             return Err(HostError::engine(
@@ -95,8 +93,8 @@ impl Seq2SeqModel {
     }
 
     /// Zero-copy view of all weight tensors.
-    pub fn weights(&self) -> Result<Seq2SeqWeights<'_>, HostError> {
-        Seq2SeqWeights::new(&self.data[SEQ2SEQ_HEADER_BYTES / 4..], &self.config)
+    pub fn weights(&self) -> Result<Weights<'_>, HostError> {
+        Weights::new(&self.data[SEQ2SEQ_HEADER_BYTES / 4..], &self.config)
             .map_err(|e| HostError::engine(&self.path, e))
     }
 

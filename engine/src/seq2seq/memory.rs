@@ -1,6 +1,6 @@
 //! Memory-budget arithmetic for the seq2seq working arena.
 //!
-//! Computes, from a [`Seq2SeqConfig`] and the source/target lengths alone, how
+//! Computes, from a [`Config`] and the source/target lengths alone, how
 //! large the working arena must be — before any buffer is touched. This is the
 //! seq2seq counterpart of [`crate::llama::memory`], and the contract is the same: the
 //! seq2seq run state carves exactly this budget from the caller's arena, once,
@@ -28,7 +28,7 @@
 //!   logits), shared between the encoder's per-position loops and the decoder
 //!   step.
 
-use crate::seq2seq::config::Seq2SeqConfig;
+use crate::seq2seq::config::Config;
 
 const F32: usize = core::mem::size_of::<f32>();
 
@@ -37,19 +37,19 @@ const F32: usize = core::mem::size_of::<f32>();
 /// `enc_x` + sublayer outputs (each `src_len × d_model`), one layer's K and V
 /// (each `src_len × d_model`; overwritten layer by layer), and one `src_len`
 /// score row.
-pub const fn seq2seq_encoder_floats(c: &Seq2SeqConfig, src_len: usize) -> usize {
+pub const fn seq2seq_encoder_floats(c: &Config, src_len: usize) -> usize {
     4 * src_len * c.d_model + src_len
 }
 
 /// `f32` count of the cross-attention KV cache: K and V over the encoder
 /// output, per decoder layer — projected once, read every decode step.
-pub const fn seq2seq_cross_kv_floats(c: &Seq2SeqConfig, src_len: usize) -> usize {
+pub const fn seq2seq_cross_kv_floats(c: &Config, src_len: usize) -> usize {
     2 * c.dec_layers * src_len * c.d_model
 }
 
 /// `f32` count of the decoder's causal self-attention KV cache, sized for
 /// `tgt_len` target positions.
-pub const fn seq2seq_self_kv_floats(c: &Seq2SeqConfig, tgt_len: usize) -> usize {
+pub const fn seq2seq_self_kv_floats(c: &Config, tgt_len: usize) -> usize {
     2 * c.dec_layers * tgt_len * c.d_model
 }
 
@@ -57,7 +57,7 @@ pub const fn seq2seq_self_kv_floats(c: &Seq2SeqConfig, tgt_len: usize) -> usize 
 /// scratch vectors, the query (all `d_model`), the FFN buffer (the wider of the
 /// two stacks), per-head attention scores over the longer of the two sequences,
 /// and the output logits.
-pub const fn seq2seq_step_floats(c: &Seq2SeqConfig, src_len: usize, tgt_len: usize) -> usize {
+pub const fn seq2seq_step_floats(c: &Config, src_len: usize, tgt_len: usize) -> usize {
     // (`Ord::max` is not `const`, so pick the larger by hand.)
     let ffn = if c.enc_ffn > c.dec_ffn {
         c.enc_ffn
@@ -74,7 +74,7 @@ pub const fn seq2seq_step_floats(c: &Seq2SeqConfig, src_len: usize, tgt_len: usi
 /// `const`, so an embedded host can size a `static`/stack arena — and
 /// `const`-assert it fits a fixed RAM budget — at compile time, exactly like
 /// [`crate::llama::memory::arena_floats`] on the Llama path.
-pub const fn seq2seq_arena_floats(c: &Seq2SeqConfig, src_len: usize, tgt_len: usize) -> usize {
+pub const fn seq2seq_arena_floats(c: &Config, src_len: usize, tgt_len: usize) -> usize {
     seq2seq_encoder_floats(c, src_len)
         + seq2seq_cross_kv_floats(c, src_len)
         + seq2seq_self_kv_floats(c, tgt_len)
@@ -83,7 +83,7 @@ pub const fn seq2seq_arena_floats(c: &Seq2SeqConfig, src_len: usize, tgt_len: us
 
 /// A broken-down seq2seq memory budget for reporting.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct Seq2SeqMemoryBudget {
+pub struct MemoryBudget {
     /// `f32` count for the encoder-side buffers.
     pub encoder_floats: usize,
     /// `f32` count for the cross-attention KV cache.
@@ -94,10 +94,10 @@ pub struct Seq2SeqMemoryBudget {
     pub step_floats: usize,
 }
 
-impl Seq2SeqMemoryBudget {
+impl MemoryBudget {
     /// Compute the budget for a config at the given sequence lengths.
-    pub const fn for_config(c: &Seq2SeqConfig, src_len: usize, tgt_len: usize) -> Self {
-        Seq2SeqMemoryBudget {
+    pub const fn for_config(c: &Config, src_len: usize, tgt_len: usize) -> Self {
+        MemoryBudget {
             encoder_floats: seq2seq_encoder_floats(c, src_len),
             cross_kv_floats: seq2seq_cross_kv_floats(c, src_len),
             self_kv_floats: seq2seq_self_kv_floats(c, tgt_len),
@@ -147,8 +147,8 @@ mod tests {
     use super::*;
     use crate::seq2seq::config::Activation;
 
-    fn tiny_config() -> Seq2SeqConfig {
-        Seq2SeqConfig {
+    fn tiny_config() -> Config {
+        Config {
             d_model: 4,
             enc_layers: 1,
             dec_layers: 1,
@@ -180,7 +180,7 @@ mod tests {
         assert_eq!(seq2seq_step_floats(&c, src, tgt), 46);
         assert_eq!(seq2seq_arena_floats(&c, src, tgt), 102 + 48 + 40 + 46);
 
-        let b = Seq2SeqMemoryBudget::for_config(&c, src, tgt);
+        let b = MemoryBudget::for_config(&c, src, tgt);
         assert_eq!(b.total_floats(), seq2seq_arena_floats(&c, src, tgt));
         assert_eq!(b.total_bytes(), b.total_floats() * 4);
     }
@@ -189,7 +189,7 @@ mod tests {
     fn opus_mt_en_fr_budget_is_tens_of_mib() {
         // The realistic figure the host will report for a ~75M-param OPUS-MT
         // pair model at its maximum sequence lengths.
-        let c = Seq2SeqConfig {
+        let c = Config {
             d_model: 512,
             enc_layers: 6,
             dec_layers: 6,
@@ -207,7 +207,7 @@ mod tests {
             activation: Activation::Swish,
             scale_embedding: true,
         };
-        let b = Seq2SeqMemoryBudget::for_config(&c, c.max_src, c.max_tgt);
+        let b = MemoryBudget::for_config(&c, c.max_src, c.max_tgt);
         // The two KV caches dominate, like the Llama path's KV cache.
         assert_eq!(b.cross_kv_floats, 2 * 6 * 512 * 512);
         assert_eq!(b.self_kv_floats, 2 * 6 * 512 * 512);
@@ -219,7 +219,7 @@ mod tests {
     fn budget_is_const_evaluable() {
         // Forcing the evaluation in a const context guards the `const fn`-ness
         // against regressing (the bare-metal sizing story depends on it).
-        const C: Seq2SeqConfig = Seq2SeqConfig {
+        const C: Config = Config {
             d_model: 4,
             enc_layers: 1,
             dec_layers: 1,
@@ -238,7 +238,7 @@ mod tests {
             scale_embedding: true,
         };
         const FLOATS: usize = seq2seq_arena_floats(&C, 6, 5);
-        const BUDGET: Seq2SeqMemoryBudget = Seq2SeqMemoryBudget::for_config(&C, 6, 5);
+        const BUDGET: MemoryBudget = MemoryBudget::for_config(&C, 6, 5);
         const _: () = assert!(BUDGET.total_bytes() == FLOATS * F32);
         assert_eq!(FLOATS, 236);
         assert_eq!(BUDGET.total_floats(), FLOATS);
