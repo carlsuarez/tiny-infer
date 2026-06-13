@@ -2,23 +2,36 @@
 //!
 //! `no_std`, allocation-free core of the tiny-infer transformer inference engine.
 //!
-//! This crate deliberately depends on nothing but `core`. It owns the parts of the
-//! system that must run on an embedded/edge target: the model [`Config`], the
-//! zero-copy [`Weights`] view over a checkpoint's `f32` region, the bump [`Arena`]
-//! that backs every working buffer, and the [`memory`] budget math used to size that
-//! arena ahead of time.
+//! This crate deliberately depends on nothing but `core` (and [`libm`] for the
+//! transcendental functions `core` lacks). The host crate (which *is* `std`) owns
+//! file IO, the byte→`f32` cast, the tokenizer, and the CLI.
 //!
-//! The host crate (which *is* `std`) is responsible for file IO, the byte→`f32` cast,
-//! the tokenizer, and the CLI.
+//! ## Structure: a shared core plus two architectures
 //!
-//! Milestone 1 implements config/weight parsing, the arena, and the memory budget.
-//! Milestone 2 adds the fp32 [`math`] kernels, the [`RunState`] working set, and the
-//! [`forward`] pass that turns a token into vocabulary logits.
+//! The crate is organized so the architecture split is visible in the module tree.
+//! A small **shared core** holds the building blocks that are independent of any one
+//! model shape:
 //!
-//! Beyond the decoder-only Llama path, the [`seq2seq`] module (behind the on-by-default
-//! `seq2seq` cargo feature) adds a second architecture: Marian / OPUS-MT encoder-decoder
-//! translation models, with their own checkpoint format, weight views, and arena budget.
-//! Disable the feature for a decoder-only build.
+//! * [`arena`] — the bump [`Arena`] that backs every working buffer.
+//! * [`error`] — the crate-wide [`EngineError`].
+//! * [`math`] — the fp32 and int8 compute kernels (matmul, norms, attention, …).
+//! * [`quant`] — the group-wise int8 quantization *primitives* ([`QuantizedTensor`]
+//!   and the quantize/dequantize routines the kernels operate on).
+//!
+//! On top of that core sit two **parallel, self-contained architecture modules**,
+//! each owning its own config, weight layout, arena budget, working state, and
+//! forward pass:
+//!
+//! * [`llama`] — the decoder-only **Llama-2** path (llama2.c-compatible: RMSNorm,
+//!   RoPE, SwiGLU, causal GQA). Always compiled in; it defines the crate-root API
+//!   ([`Config`], [`Weights`], [`forward`], [`ModelWeights`], …, all re-exported
+//!   here from [`llama`]).
+//! * [`seq2seq`] — the encoder-decoder **Marian / OPUS-MT** path (LayerNorm with
+//!   bias, sinusoidal positions, cross-attention). Behind the on-by-default
+//!   `seq2seq` cargo feature; disable it for a lean decoder-only build.
+//!
+//! The two architecture modules never reference each other — they meet only at the
+//! shared core — so the directory layout mirrors exactly how separate they are.
 //!
 //! # `no_std` and panic policy
 //!
@@ -33,7 +46,7 @@
 //!
 //! **Allocation.** Nothing here allocates. The working set is carved once from a
 //! caller-provided [`Arena`] and reused in place every step; the budget is a `const fn`
-//! of the [`Config`] ([`memory::arena_floats`]), so a host can size a `static` arena —
+//! of the [`Config`] ([`llama::memory::arena_floats`]), so a host can size a `static` arena —
 //! and `const`-assert it fits a fixed RAM budget — at compile time.
 //!
 //! **Panics.** Every operation driven by *external* input — parsing a checkpoint header,
@@ -52,24 +65,30 @@
 #![forbid(unsafe_op_in_unsafe_fn)]
 #![warn(missing_docs)]
 
+// Shared core: building blocks independent of any one architecture.
 pub mod arena;
-pub mod config;
 pub mod error;
 pub mod math;
-pub mod memory;
-pub mod model;
-pub mod quantize;
+pub mod quant;
+
+// Architectures, each layered on the shared core.
+pub mod llama;
 #[cfg(feature = "seq2seq")]
 pub mod seq2seq;
-pub mod state;
-pub mod weights;
 
+// Shared-core re-exports.
 pub use arena::Arena;
-pub use config::{parse_header, Config, ModelFormat};
 pub use error::EngineError;
-pub use model::{forward, Kernel, ModelWeights};
-pub use quantize::{QuantizedTensor, QuantizedWeights};
+pub use quant::QuantizedTensor;
+
+// Llama-2 (decoder-only) is the crate-root API — re-exported unqualified so callers
+// use `engine::Config`, `engine::forward`, … without naming the architecture.
+pub use llama::config::{parse_header, Config, ModelFormat};
+pub use llama::model::{forward, Kernel, ModelWeights};
+pub use llama::quantize::QuantizedWeights;
+pub use llama::state::{QuantScratch, RunState};
+pub use llama::weights::Weights;
+
+// Seq2seq (encoder-decoder), behind the `seq2seq` feature.
 #[cfg(feature = "seq2seq")]
-pub use seq2seq::{Activation, Seq2SeqConfig, Seq2SeqWeights};
-pub use state::{QuantScratch, RunState};
-pub use weights::Weights;
+pub use seq2seq::{encode, Activation, Seq2SeqConfig, Seq2SeqState, Seq2SeqWeights};
