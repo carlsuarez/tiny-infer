@@ -545,7 +545,7 @@ pub fn layernorm(out: &mut [f32], x: &[f32], w: &[f32], b: &[f32]) {
 /// weights. (The host's temperature sampler applies the same max-shift trick over
 /// the logits, but inline, since it only borrows them immutably.)
 pub fn softmax(x: &mut [f32]) {
-    let max_val = maxf(x);
+    let max_val = x.iter().copied().max_by(|a, b| a.total_cmp(b)).unwrap();
 
     // Exponentiate the max-shifted values and accumulate their sum.
     let mut sum = 0.0f32;
@@ -746,29 +746,6 @@ pub fn sinusoidal_into(buf: &mut [f32], pos: usize, dim: usize) {
 /// with `scale_embedding = false` simply skip the multiply.
 pub fn embed_scale(dim: usize) -> f32 {
     libm::sqrtf(dim as f32)
-}
-
-/// Return the maximum element of `buf`.
-///
-/// A small helper used by [`softmax`] for its max-shift. Unlike `Iterator::max`,
-/// this works directly on `f32` (which is only `PartialOrd`): it seeds with
-/// `buf[0]` and keeps any element that compares strictly greater. A `NaN` later in
-/// the slice is skipped (`val > max` is false), but a `NaN` in `buf[0]` seeds the
-/// running max and is returned — matching llama2.c, which also seeds from `x[0]`.
-/// Real inference inputs are finite, so this edge case never arises in practice.
-///
-/// # Panics
-/// In debug builds, if `buf` is empty.
-pub fn maxf(buf: &[f32]) -> f32 {
-    debug_assert!(!buf.is_empty());
-
-    let mut max = buf[0];
-    for &val in buf.iter() {
-        if val > max {
-            max = val;
-        }
-    }
-    max
 }
 
 /// Add `src` into `dst` element-wise: `dst[i] += src[i]`.
@@ -1073,15 +1050,6 @@ mod tests {
         // q's second pair WAS rotated (head_dim = 2 % 2 = 0, angle = 1 rad).
         assert!(close(q[2], 1.0f32.cos()));
         assert!(close(q[3], 1.0f32.sin()));
-    }
-
-    #[test]
-    fn maxf_finds_max_ignoring_later_nan() {
-        assert!(close(maxf(&[1.0, 5.0, -3.0, 2.0]), 5.0));
-        // A NaN after the first element is skipped (`val > max` is false).
-        assert!(close(maxf(&[1.0, f32::NAN, 2.0]), 2.0));
-        // Single element returns itself.
-        assert!(close(maxf(&[42.0]), 42.0));
     }
 
     #[test]

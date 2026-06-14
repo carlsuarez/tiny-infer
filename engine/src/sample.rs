@@ -28,7 +28,7 @@
 use rand::rngs::Xoshiro128PlusPlus;
 use rand::{RngExt, SeedableRng};
 
-use crate::math::{argmax, maxf};
+use crate::math::argmax;
 
 /// A `(probability, token)` pair — one element of the top-p nucleus scratch.
 ///
@@ -85,7 +85,12 @@ impl Sampler {
 
         // Unnormalized softmax weight of one logit (max-shifted for stability). Captured by
         // value so the closure doesn't borrow `self` (the helpers below need `&mut self`).
-        let (max, temperature) = (maxf(logits), self.temperature);
+        let temperature = self.temperature;
+        let max = logits
+            .iter()
+            .copied()
+            .max_by(|a, b| a.total_cmp(b))
+            .unwrap();
         let weight = move |v: f32| libm::expf((v - max) / temperature);
         let sum: f32 = logits.iter().copied().map(weight).sum();
 
@@ -215,9 +220,7 @@ mod tests {
         // overwhelming majority of the time.
         let logits = [0.0f32, 0.0, 8.0, 0.0];
         let mut s = Sampler::new(1.0, 0.0, 42); // topp 0 ⇒ full distribution
-        let hits = (0..200)
-            .filter(|_| s.sample(&logits, &mut []) == 2)
-            .count();
+        let hits = (0..200).filter(|_| s.sample(&logits, &mut []) == 2).count();
         assert!(hits > 180, "peak token won only {hits}/200 draws");
     }
 
