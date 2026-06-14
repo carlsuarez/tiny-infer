@@ -71,6 +71,25 @@ fn unknown_flag_fails_with_usage() {
 }
 
 #[test]
+fn unrecognized_format_fails_cleanly() {
+    // A file matching neither the seq2seq magic nor a plausible llama header (a
+    // foreign 4-byte tag followed by a zeroed `hidden_dim`) routes to neither loader
+    // and reports a clean "unrecognized" error instead of crashing.
+    let dir = std::env::temp_dir();
+    let path = dir.join("tiny_infer_unrecognized.bin");
+    let mut bytes = b"ZZZZ".to_vec();
+    bytes.resize(64, 0); // 64 bytes total, f32-aligned
+    std::fs::write(&path, &bytes).unwrap();
+
+    let out = Command::new(BIN).arg(&path).output().unwrap();
+    let _ = std::fs::remove_file(&path);
+    assert!(!out.status.success());
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(stderr.contains("unrecognized"), "stderr:\n{stderr}");
+    assert!(!stderr.contains("panicked"), "stderr:\n{stderr}");
+}
+
+#[test]
 fn truncated_checkpoint_reports_size_mismatch() {
     // A 28-byte header claiming the stories15M shape, with no weight data:
     // the loader must reject it as a size mismatch, not crash.

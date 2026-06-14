@@ -38,6 +38,33 @@ pub const VERSIONED_HEADER_BYTES: usize = 256;
 /// Legacy files start directly with `dim`, which is never remotely this large.
 pub const MAGIC: u32 = 0x616b_3432;
 
+/// Whether `bytes` look like a llama2.c checkpoint of any supported format — the
+/// counterpart of [`is_seq2seq`](crate::seq2seq::config::is_seq2seq) for routing a
+/// file to this architecture.
+///
+/// Two positive signals:
+/// * a versioned (v1/v2) file opens with the [`MAGIC`] `"ak42"`;
+/// * a **legacy** ("version 0") file carries *no* magic, so the only signal is that
+///   its seven-`i32` header parses as a valid [`Config`].
+///
+/// Because the legacy format is magic-less, this is a **fallback** predicate: it
+/// returns `true` for any file whose first [`HEADER_BYTES`] happen to form a plausible
+/// llama header — *including* another architecture's checkpoint (a seq2seq `"tis2"`
+/// file, for instance, parses as a nonsense-but-structurally-valid legacy config). A
+/// dispatcher must therefore test the magic-bearing formats (seq2seq, and any future
+/// architecture) **before** falling back to `is_llama`; only the magic-less legacy
+/// format legitimately has nothing else to match on.
+pub fn is_llama(bytes: &[u8]) -> bool {
+    // Versioned formats are positively identified by the magic alone (the loader
+    // validates the rest); the magic is also far larger than any real `dim`, so it
+    // can never be confused with a legacy header.
+    if bytes.len() >= 4 && u32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]) == MAGIC {
+        return true;
+    }
+    // Legacy: no magic to check, so accept it iff the raw header is a valid config.
+    Config::parse(bytes).is_ok()
+}
+
 /// Which on-disk checkpoint format a file uses, as detected by [`parse_header`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ModelFormat {
@@ -400,6 +427,34 @@ mod tests {
             parse_header(&bytes).unwrap_err(),
             EngineError::InvalidConfig(ConfigField::VocabSize)
         );
+    }
+
+    #[test]
+    fn is_llama_accepts_legacy_and_versioned() {
+        // Legacy (no magic), v1, and v2 are all recognized.
+        assert!(is_llama(&header(STORIES15M)));
+        assert!(is_llama(&versioned_header(1, STORIES15M, 1, None)));
+        assert!(is_llama(&versioned_header(2, STORIES15M, 1, Some(32))));
+    }
+
+    #[test]
+    fn is_llama_rejects_nonsense_and_short_headers() {
+        // All-zero fields: dim = 0 fails the legacy parse.
+        assert!(!is_llama(&[0u8; HEADER_BYTES]));
+        // Too short to even hold the seven-int legacy header.
+        assert!(!is_llama(&[0u8; 12]));
+    }
+
+    #[test]
+    fn is_llama_versioned_needs_the_exact_ak42_magic() {
+        // A foreign magic is not a versioned llama file. With the rest of the header
+        // zeroed it also fails the legacy fallback (hidden_dim = 0), so it is rejected
+        // outright — but note a *fully formed* foreign header (e.g. a real seq2seq one)
+        // would pass the magic-less legacy parse, which is why magic-bearing formats
+        // must be routed first. See [`is_llama`].
+        let mut bytes = [0u8; HEADER_BYTES];
+        bytes[..4].copy_from_slice(b"tis2");
+        assert!(!is_llama(&bytes));
     }
 
     #[test]

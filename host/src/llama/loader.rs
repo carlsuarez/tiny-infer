@@ -30,12 +30,43 @@ use std::fs::File;
 use std::io::Read;
 use std::path::{Path, PathBuf};
 
-use engine::llama::config::VERSIONED_HEADER_BYTES;
+use engine::llama::config::{is_llama, HEADER_BYTES, VERSIONED_HEADER_BYTES};
 use engine::llama::quantize::{quantized_scale_count, quantized_weight_count, v2_tensor_sizes};
 use engine::llama::weights::expected_file_bytes;
 use engine::llama::{parse_header, Config, ModelFormat, Weights};
 
 use crate::error::HostError;
+
+/// Whether the file at `path` looks like a llama2.c checkpoint (legacy, v1, or v2) —
+/// the sibling of [`is_seq2seq_file`](crate::seq2seq::is_seq2seq_file).
+///
+/// Reads only the leading header bytes and defers to [`is_llama`]. Unlike the seq2seq
+/// check, the legacy llama format has no magic, so this is a **fallback**: a file whose
+/// first bytes form a plausible seven-int header passes even if it belongs to another
+/// architecture. The dispatcher in `main` must therefore check the magic-bearing
+/// formats (seq2seq, and any future architecture) *before* this one — see [`is_llama`].
+///
+/// A missing file is an [`HostError::Io`]; a file too short to identify is simply not a
+/// llama checkpoint.
+pub fn is_llama_file(path: impl AsRef<Path>) -> Result<bool, HostError> {
+    let path = path.as_ref();
+    let mut file = File::open(path).map_err(|e| HostError::io(path, e))?;
+
+    // The versioned magic sits in the first 4 bytes; the legacy header needs all
+    // `HEADER_BYTES`. Read up to that many, tolerating a shorter file (which then
+    // simply fails to identify as llama).
+    let mut header = [0u8; HEADER_BYTES];
+    let mut filled = 0;
+    while filled < header.len() {
+        match file.read(&mut header[filled..]) {
+            Ok(0) => break,
+            Ok(n) => filled += n,
+            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+            Err(e) => return Err(HostError::io(path, e)),
+        }
+    }
+    Ok(is_llama(&header[..filled]))
+}
 
 /// A loaded checkpoint: parsed config and format, plus the whole file as `f32`.
 pub struct Model {
