@@ -6,7 +6,7 @@
 //! seq2seq run state carves exactly this budget from the caller's arena, once,
 //! and the forward passes then allocate nothing.
 //!
-//! Translation needs more resident state than decoder-only generation, because
+//! A seq2seq pass needs more resident state than decoder-only generation, because
 //! encoder self-attention is **all-to-all** — every source position attends to
 //! every other — so the whole source-side residual stream stays live:
 //!
@@ -68,7 +68,7 @@ pub const fn seq2seq_step_floats(c: &Config, src_len: usize, tgt_len: usize) -> 
     4 * c.d_model + ffn + c.dec_heads * span + c.vocab_size
 }
 
-/// Total `f32` the seq2seq arena must hold for one translation of up to
+/// Total `f32` the seq2seq arena must hold for one run of up to
 /// `src_len` source and `tgt_len` target tokens.
 ///
 /// `const`, so an embedded host can size a `static`/stack arena — and

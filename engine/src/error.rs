@@ -38,12 +38,10 @@ pub enum EngineError {
     },
     /// The file does not begin with the seq2seq checkpoint magic (`"tis2"`), so
     /// it is not a tiny-infer seq2seq checkpoint.
-    #[cfg(feature = "seq2seq")]
     NotSeq2Seq,
     /// A seq2seq config field held a value the engine cannot use (e.g. zero, a
     /// special-token id outside the vocabulary, or a head count that does not
     /// divide `d_model`).
-    #[cfg(feature = "seq2seq")]
     InvalidSeq2SeqConfig(Seq2SeqField),
 }
 
@@ -73,7 +71,6 @@ pub enum ConfigField {
 
 /// Identifies which [`Config`](crate::seq2seq::Config) field
 /// failed validation.
-#[cfg(feature = "seq2seq")]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum Seq2SeqField {
@@ -131,11 +128,9 @@ impl fmt::Display for EngineError {
                 f,
                 "arena overflow: requested {requested} bytes, only {available} available"
             ),
-            #[cfg(feature = "seq2seq")]
             EngineError::NotSeq2Seq => {
                 f.write_str("checkpoint does not start with the seq2seq magic \"tis2\"")
             }
-            #[cfg(feature = "seq2seq")]
             EngineError::InvalidSeq2SeqConfig(field) => {
                 write!(f, "invalid seq2seq model config: bad {field:?} field")
             }

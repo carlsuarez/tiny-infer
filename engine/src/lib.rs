@@ -2,9 +2,10 @@
 //!
 //! `no_std`, allocation-free core of the tiny-infer transformer inference engine.
 //!
-//! This crate deliberately depends on nothing but `core` (and [`libm`] for the
-//! transcendental functions `core` lacks). The host crate (which *is* `std`) owns
-//! file IO, the byte→`f32` cast, the tokenizer, and the CLI.
+//! This crate deliberately keeps its dependencies tiny and `no_std`: [`libm`] for the
+//! transcendental functions `core` lacks, and [`rand`] (no default features) for the
+//! sampler's seedable PRNG. The host crate (which *is* `std`) owns file IO, the byte→`f32`
+//! cast, the tokenizer, and the CLI.
 //!
 //! ## Structure: a shared core plus two architectures
 //!
@@ -17,6 +18,8 @@
 //! * [`math`] — the fp32 and int8 compute kernels (matmul, norms, attention, …).
 //! * [`quant`] — the group-wise int8 quantization *primitives* ([`QuantizedTensor`]
 //!   and the quantize/dequantize routines the kernels operate on).
+//! * [`sample`] — the [`Sampler`] that turns a logits row into the next token id
+//!   (greedy / temperature / top-p), shared by both decode loops.
 //!
 //! On top of that core sit two **parallel, self-contained architecture modules**,
 //! each owning its own config, weight layout, arena budget, working state, and
@@ -29,8 +32,7 @@
 //!   reached through the module path, `engine::llama::*`.
 //! * [`seq2seq`] — the encoder-decoder **Marian / OPUS-MT** path (LayerNorm with
 //!   bias, sinusoidal positions, cross-attention), reached through
-//!   `engine::seq2seq::*`. Behind the on-by-default `seq2seq` cargo feature; disable
-//!   it for a lean decoder-only build.
+//!   `engine::seq2seq::*`.
 //!
 //! The two architecture modules never reference each other — they meet only at the
 //! shared core — so the directory layout mirrors exactly how separate they are. Each
@@ -39,8 +41,9 @@
 //!
 //! # `no_std` and panic policy
 //!
-//! The crate compiles against nothing but `core` and [`libm`] (for the transcendental
-//! functions `core` lacks). It is verified on a bare-metal target two ways: the library
+//! The crate compiles against `core` plus two `no_std` crates — [`libm`] (for the
+//! transcendental functions `core` lacks) and [`rand`] (the sampler PRNG, no default
+//! features so it pulls in no `std`/OS entropy). It is verified on a bare-metal target two ways: the library
 //! itself (`cargo build -p engine --target thumbv7em-none-eabi`) and a freestanding
 //! firmware binary that supplies its own `#[panic_handler]` and runs a full forward pass
 //! out of stack buffers with no allocator (`examples/baremetal.rs`). Because every
@@ -74,12 +77,12 @@ pub mod arena;
 pub mod error;
 pub mod math;
 pub mod quant;
+pub mod sample;
 
 // Architectures, each layered on the shared core. Their public types are reached
 // through the module path — `engine::llama::Config`, `engine::seq2seq::Config`, … —
 // so the two never collide and the directory layout *is* the API surface.
 pub mod llama;
-#[cfg(feature = "seq2seq")]
 pub mod seq2seq;
 
 // Shared-core re-exports (architecture-agnostic, so unqualified at the root).
@@ -87,3 +90,4 @@ pub use arena::Arena;
 pub use error::EngineError;
 pub use math::Kernel;
 pub use quant::{QuantScratch, QuantizedTensor};
+pub use sample::Sampler;

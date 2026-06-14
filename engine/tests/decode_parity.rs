@@ -11,8 +11,6 @@
 //! encoder test's float tolerance, this gate is exact: greedy argmax token ids must
 //! match HF id-for-id.
 
-#![cfg(feature = "seq2seq")]
-
 use std::path::PathBuf;
 
 use engine::seq2seq::config::SEQ2SEQ_HEADER_BYTES;

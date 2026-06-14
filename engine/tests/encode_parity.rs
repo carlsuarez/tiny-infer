@@ -9,8 +9,6 @@
 //! Feeding the engine the *same* token ids HF used isolates the encoder math from
 //! any tokenizer differences (the tokenizer is a separate, later milestone).
 
-#![cfg(feature = "seq2seq")]
-
 use std::path::PathBuf;
 
 use engine::seq2seq::config::SEQ2SEQ_HEADER_BYTES;

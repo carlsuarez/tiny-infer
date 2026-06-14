@@ -1,11 +1,15 @@
-//! Encoder-decoder (seq2seq) architecture support: Marian / OPUS-MT translation
-//! models, alongside the decoder-only Llama path.
+//! Encoder-decoder (seq2seq) architecture support: Marian / OPUS-MT models,
+//! alongside the decoder-only Llama path.
+//!
+//! The encoder-decoder shape underlies any sequence-to-sequence task — translation,
+//! summarization, paraphrasing, grammar correction — that maps an input sequence to a
+//! freshly generated output sequence; the OPUS-MT checkpoints used as fixtures happen
+//! to be translation models, but nothing here is specific to translation.
 //!
 //! This module is the second architecture the engine ships. It is deliberately
 //! **parallel** to the decoder-only path — nothing here touches [`Config`],
 //! [`forward`], or the RoPE/RMSNorm kernels, whose llama2.c parity gate must stay
-//! bit-identical. The whole module sits behind the `seq2seq` cargo feature so a
-//! decoder-only embedded build carries none of it.
+//! bit-identical — so it stays fully self-contained even though it is always compiled in.
 //!
 //! A Marian model differs from Llama in shape, not just weights: a bidirectional
 //! encoder stack feeds a decoder stack through cross-attention, normalization is
@@ -23,7 +27,7 @@
 //! * [`state`] — [`RunState`], the working buffers carved once from the arena.
 //! * [`model`] — the forward passes: [`encode`] (the bidirectional encoder),
 //!   [`decode_step`] (one autoregressive decoder step) with [`precompute_cross_kv`],
-//!   and the [`greedy_decode`] convenience that drives them end to end — over fp32 *or*
+//!   and the [`greedy_decode`] convenience that drives a full sequence end to end — over fp32 *or*
 //!   int8 weights via [`ModelWeights`].
 //! * [`quantize`] — int8 quantization of the Marian weight set ([`QuantizedWeights`] for
 //!   the 17 matmul matrices, [`KeptWeights`] for the fp32 biases / LayerNorms), layered

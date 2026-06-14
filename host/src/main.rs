@@ -3,8 +3,8 @@
 //! A thin front end over two architecture modules that mirror the engine's split:
 //! * [`llama`] — decoder-only llama2.c checkpoints: report, generate (`--prompt`),
 //!   or convert between formats.
-//! * [`seq2seq`] — Marian / OPUS-MT translation checkpoints: report, or translate
-//!   (`--prompt`).
+//! * [`seq2seq`] — Marian / OPUS-MT encoder-decoder checkpoints: report, or generate an
+//!   output sequence from the prompt (`--prompt`).
 //!
 //! [`main`] parses the arguments and [`run`] dispatches to the right module by
 //! sniffing the checkpoint's magic; everything else lives in the modules.
@@ -26,8 +26,9 @@ The architecture is detected from the checkpoint's magic, and the flags below sp
 accordingly:
   * Llama   — decoder-only llama2.c checkpoints (legacy / v1 / v2). With --prompt +
               a tokenizer, generates text; supports int8 quantization and conversion.
-  * Seq2seq — Marian / OPUS-MT translation models (scripts/export_marian.py). With
-              --prompt, translates the text to the model's target language; supports
+  * Seq2seq — Marian / OPUS-MT encoder-decoder models (scripts/export_marian.py). With
+              --prompt, runs the encoder-decoder to generate an output sequence for the
+              input (translation, summarization, … depending on the model); supports
               int8 quantization too (only conversion is Llama-only).
 With no --prompt, either path reports the model's config and memory budget instead.
 
@@ -42,12 +43,21 @@ ARGS:
 BOTH ARCHITECTURES:
     -m, --model <PATH>        Model path (alternative to the positional <MODEL>)
     -t, --tokenizer <PATH>    Tokenizer path (alternative to the positional)
-    -p, --prompt <TEXT>       Llama: text to continue · seq2seq: text to translate
+    -p, --prompt <TEXT>       Llama: text to continue · seq2seq: input sequence to transform
         --scalar              Use the scalar matmul kernels instead of the default
                               core::simd ones (the readable reference path)
     -h, --help                Print this help and exit
 
-  int8 quantization (Llama generation · seq2seq translation):
+  sampling (Llama generation · seq2seq generation):
+        --temperature <F>     Sampling temperature (default 0 = greedy/deterministic;
+                              higher = more random). For seq2seq, greedy (temp 0) —
+                              or beam search — is the quality path; temperature/top-p add
+                              diversity, not accuracy.
+        --topp <F>            Nucleus (top-p) threshold in (0,1): sample only from the
+                              most-probable tokens summing to F
+        --seed <N>            RNG seed for reproducible sampling (default: random)
+
+  int8 quantization (Llama generation · seq2seq generation):
     -q, --quantize            Quantize matmul weights to int8 (group-wise) before
                               running — smaller weight footprint, slightly lossy
         --group-size <N>      Int8 group size; must divide the model's matmul dims
@@ -60,20 +70,15 @@ BOTH ARCHITECTURES:
 LLAMA ONLY:
   generation (with --prompt):
     -n, --steps <N>           Max tokens to generate (default: model seq_len)
-        --temperature <F>     Sampling temperature (default 0 = greedy/deterministic;
-                              higher = more random)
-        --topp <F>            Nucleus (top-p) threshold in (0,1): sample only from the
-                              most-probable tokens summing to F
-        --seed <N>            RNG seed for reproducible sampling (default: random)
   format conversion:
         --convert <PATH>      Convert the checkpoint to PATH and exit (no generation)
         --to <v1|v2>          Conversion target (default v2 = int8 Q8_0 / runq.c's
                               format, uses --group-size; v1 = fp32, versioned header)
 
 SEQ2SEQ (Marian / OPUS-MT) ONLY:
-    Translation is driven by --prompt (add --scalar / -q / --dotprod as above); the
-    tokenizer defaults to tokenizer.bin next to the model. Format conversion (--convert)
-    is Llama-only — there is no on-disk int8 seq2seq format yet.\
+    Generation is driven by --prompt (add --scalar / -q / --dotprod / --temperature as
+    above); the tokenizer defaults to tokenizer.bin next to the model. Format conversion
+    (--convert) is Llama-only — there is no on-disk int8 seq2seq format yet.\
 ";
 
 fn main() -> ExitCode {

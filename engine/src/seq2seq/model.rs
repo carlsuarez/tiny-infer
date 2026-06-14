@@ -1,6 +1,6 @@
 //! The seq2seq forward passes: the Marian **encoder** ([`encode`]), the
 //! autoregressive **decoder** ([`decode_step`] with [`precompute_cross_kv`]), and the
-//! [`greedy_decode`] convenience that drives a full translation.
+//! [`greedy_decode`] convenience that drives a full output sequence.
 //!
 //! [`encode`] runs the Marian encoder over a tokenized source sentence and leaves
 //! the `src_len × d_model` encoder output in [`RunState::enc_x`] — the
@@ -609,8 +609,8 @@ pub fn decode_step<'s>(
     &s.logits[..]
 }
 
-/// Greedily translate `src_ids`, writing the target token ids into `out_ids` and
-/// returning how many were written.
+/// Greedily decode an output sequence from `src_ids`, writing the target token ids into
+/// `out_ids` and returning how many were written.
 ///
 /// The whole pipeline end to end: [`encode`] the source, [`precompute_cross_kv`],
 /// then loop [`decode_step`] feeding back the argmax — starting from the decoder-start

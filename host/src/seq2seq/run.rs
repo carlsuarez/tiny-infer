@@ -1,4 +1,5 @@
-//! The seq2seq entry point: translate a prompt, or report on the model.
+//! The seq2seq entry point: generate an output sequence from a prompt, or report on
+//! the model.
 
 use std::path::{Path, PathBuf};
 
@@ -7,17 +8,18 @@ use engine::seq2seq::quantize::{
     KeptWeights, QuantizedWeights,
 };
 use engine::seq2seq::{Config, ModelWeights};
+use engine::Sampler;
 
 use crate::args::Args;
 use crate::error::HostError;
-use crate::llama::generate::{report_quantization, select_kernel};
+use crate::llama::generate::{report_quantization, resolve_seed, select_kernel};
 use crate::seq2seq::loader::Seq2SeqModel;
 use crate::seq2seq::report::report_seq2seq;
 use crate::seq2seq::tokenizer::Tokenizer;
-use crate::seq2seq::translate::translate;
+use crate::seq2seq::generate::generate;
 
-/// Run a seq2seq (Marian) checkpoint: translate `--prompt` (optionally quantized to
-/// int8), or report on the model.
+/// Run a seq2seq (Marian) checkpoint: generate an output sequence from `--prompt`
+/// (optionally quantized to int8), or report on the model.
 pub fn run(path: &str, args: &Args) -> Result<(), HostError> {
     // There is no on-disk int8 seq2seq format yet, so conversion is undefined here.
     if args.convert.is_some() {
@@ -28,7 +30,7 @@ pub fn run(path: &str, args: &Args) -> Result<(), HostError> {
     }
 
     let model = Seq2SeqModel::load(path)?;
-    let config = model.config; // Copy, so translation can outlive the file buffer.
+    let config = model.config; // Copy, so generation can outlive the file buffer.
 
     if let Some(text) = args.prompt.as_deref() {
         let tok_path = resolve_tokenizer(path, args)?;
@@ -36,9 +38,12 @@ pub fn run(path: &str, args: &Args) -> Result<(), HostError> {
         // `--scalar` forces the reference kernels; `--dotprod` selects the int8 hardware
         // kernel when generating quantized (and the CPU supports it); else `core::simd`.
         let kernel = select_kernel(args.scalar, args.dotprod);
+        // The shared sampler picks each token: greedy at temperature 0 (the default, and the
+        // quality path for seq2seq), else temperature/top-p as on the Llama path.
+        let sampler = Sampler::new(args.temperature, args.topp, resolve_seed(args.seed));
 
         // int8 path: quantize the matmul matrices at load, pack the kept fp32 tensors,
-        // free the fp32 checkpoint, then translate over the int8 weights.
+        // free the fp32 checkpoint, then generate over the int8 weights.
         if args.quantize {
             let gs = args.group_size;
             check_group_size(&config, gs)?;
@@ -56,17 +61,25 @@ pub fn run(path: &str, args: &Args) -> Result<(), HostError> {
                 .map_err(|e| HostError::engine(path, e))?;
             let kept =
                 KeptWeights::carve(&kept_buf, &config).map_err(|e| HostError::engine(path, e))?;
-            return translate(&config, &ModelWeights::Q8(qw), &kept, &tok, text, kernel);
+            return generate(&config, &ModelWeights::Q8(qw), &kept, &tok, text, kernel, sampler);
         }
 
         // fp32 path: weight views borrow straight from the loaded file.
         let weights = model.weights()?;
         let kept = KeptWeights::from_weights(&weights);
-        return translate(&config, &ModelWeights::F32(weights), &kept, &tok, text, kernel);
+        return generate(
+            &config,
+            &ModelWeights::F32(weights),
+            &kept,
+            &tok,
+            text,
+            kernel,
+            sampler,
+        );
     }
 
     // Report mode: validate the tensor carve, then print the report. (`--quantize` only
-    // affects translation; the report shows the fp32-vs-int8 comparison regardless.)
+    // affects generation; the report shows the fp32-vs-int8 comparison regardless.)
     let _ = model.weights()?;
     report_seq2seq(path, &model);
     Ok(())
@@ -108,7 +121,7 @@ fn resolve_tokenizer(model_path: &str, args: &Args) -> Result<PathBuf, HostError
         Ok(sibling)
     } else {
         Err(HostError::Usage(format!(
-            "translation needs a tokenizer; pass --tokenizer <path> or place \
+            "seq2seq generation needs a tokenizer; pass --tokenizer <path> or place \
              tokenizer.bin next to the model (looked for {})",
             sibling.display()
         )))

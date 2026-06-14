@@ -3,12 +3,13 @@
 
 use engine::llama::quantize::{quantize_weights, quantized_scale_count, quantized_weight_count};
 use engine::llama::{ModelFormat, ModelWeights, QuantizedWeights};
+use engine::Sampler;
 
 use crate::args::Args;
 use crate::error::HostError;
 use crate::llama::convert::{self, Target};
 use crate::llama::generate::{
-    check_group_size, generate, report_quantization, select_kernel, Sampler,
+    check_group_size, generate, report_quantization, resolve_seed, select_kernel,
 };
 use crate::llama::loader::Model;
 use crate::llama::report::{report_memory, report_model, report_tokenizer};
@@ -34,7 +35,7 @@ pub fn run(model_path: &str, args: &Args) -> Result<(), HostError> {
             HostError::Usage("generation (--prompt) requires a tokenizer (--tokenizer)".into())
         })?;
         let vocab = Vocab::load(tok_path, config.vocab_size)?;
-        let sampler = Sampler::new(config.vocab_size, args.temperature, args.topp, args.seed);
+        let sampler = Sampler::new(args.temperature, args.topp, resolve_seed(args.seed));
         let kernel = select_kernel(args.scalar, args.dotprod);
 
         // A v2 checkpoint is already int8: de-interleave its tensors into the

@@ -105,7 +105,7 @@ fn reports_synthetic_seq2seq_checkpoint() {
 
 #[test]
 fn seq2seq_prompt_without_tokenizer_is_usage_error() {
-    // Translating needs the SentencePiece tokenizer artifact. The synthetic
+    // Seq2seq generation needs the SentencePiece tokenizer artifact. The synthetic
     // checkpoint sits alone in a temp dir with no tokenizer.bin beside it and none
     // passed, so the prompt is a clean usage error — not a crash.
     let path = write_synthetic("tiny_infer_seq2seq_prompt.bin");

@@ -6,10 +6,8 @@ use std::time::Instant;
 
 use engine::llama::memory::{arena_floats, max_proj_d_in};
 use engine::llama::{forward, Config, Kernel, ModelWeights, QuantScratch, RunState};
-use engine::math::{argmax, maxf};
-use engine::Arena;
-use rand::rngs::StdRng;
-use rand::{RngExt, SeedableRng};
+use engine::sample::ProbIndex;
+use engine::{Arena, Sampler};
 
 use humansize::{format_size, BINARY};
 
@@ -57,6 +55,10 @@ pub(crate) fn generate(
         None => None,
     };
 
+    // Caller-owned nucleus scratch for top-p sampling (the engine sampler never allocates);
+    // sized to the vocabulary once and reused every step. Greedy/full sampling ignore it.
+    let mut probindex = vec![ProbIndex::default(); config.vocab_size];
+
     let stdout = io::stdout();
     let mut out = stdout.lock();
 
@@ -84,7 +86,7 @@ pub(crate) fn generate(
         } else {
             decode_start.get_or_insert_with(Instant::now); // prompt fully consumed
             decode_tokens += 1;
-            sampler.sample(logits) // generate the next token
+            sampler.sample(logits, &mut probindex) // generate the next token
         };
         pos += 1;
         // BOS delimits sequences in llama2.c — stop if the model emits it.
@@ -161,121 +163,12 @@ fn report_throughput(
     }
 }
 
-/// Turns a logits vector into the next token id.
-///
-/// Owns the RNG and a reusable scratch buffer so [`Sampler::sample`] allocates
-/// nothing per token. Three modes, decided by `temperature` / `topp`:
-/// * `temperature == 0` → deterministic greedy ([`argmax`]); this is the path the
-///   llama2.c parity test exercises.
-/// * `temperature > 0`, `topp` disabled (`<= 0` or `>= 1`) → draw from the full
-///   softmax(`logits / temperature`) distribution.
-/// * `temperature > 0`, `0 < topp < 1` → "nucleus" sampling: draw only from the
-///   smallest set of most-probable tokens whose cumulative probability reaches
-///   `topp`, trimming the unreliable long tail.
-pub(crate) struct Sampler {
-    temperature: f32,
-    topp: f32,
-    rng: StdRng,
-    /// `(probability, token id)` scratch for top-p, sized to the vocab up front and
-    /// reused every step so sorting the nucleus needs no per-token allocation.
-    probindex: Vec<(f32, usize)>,
-}
-
-impl Sampler {
-    pub(crate) fn new(
-        vocab_size: usize,
-        temperature: f32,
-        topp: f32,
-        seed: Option<u64>,
-    ) -> Sampler {
-        // An explicit `--seed` makes sampling reproducible; otherwise seed from the
-        // OS. (The RNG is unused at temperature 0, which is greedy.)
-        let rng = match seed {
-            Some(s) => StdRng::seed_from_u64(s),
-            None => StdRng::from_rng(&mut rand::rng()),
-        };
-        Sampler {
-            temperature,
-            topp,
-            rng,
-            probindex: Vec::with_capacity(vocab_size),
-        }
-    }
-
-    pub(crate) fn sample(&mut self, logits: &[f32]) -> usize {
-        if self.temperature == 0.0 {
-            return argmax(logits);
-        }
-
-        // Unnormalized softmax weight of one logit (max-shifted for stability).
-        // Capture by value so the closure doesn't borrow `self` (the sampling
-        // helpers below need `&mut self`).
-        let (max, temperature) = (maxf(logits), self.temperature);
-        let weight = move |v: f32| f32::exp((v - max) / temperature);
-        let sum: f32 = logits.iter().copied().map(weight).sum();
-
-        if self.topp <= 0.0 || self.topp >= 1.0 {
-            return self.sample_full(logits, &weight, sum);
-        }
-        self.sample_topp(logits, &weight, sum)
-    }
-
-    /// Draw from the full distribution via inverse-transform sampling, comparing a
-    /// scaled uniform draw against the running unnormalized cumulative weight.
-    fn sample_full(&mut self, logits: &[f32], weight: &impl Fn(f32) -> f32, sum: f32) -> usize {
-        let target = self.rng.random::<f32>() * sum; // uniform in [0, sum)
-        let mut cdf = 0.0f32;
-        for (i, &v) in logits.iter().enumerate() {
-            cdf += weight(v);
-            if cdf > target {
-                return i;
-            }
-        }
-        logits.len() - 1 // only reached if f32 rounding leaves cdf just under target
-    }
-
-    /// Top-p (nucleus) sampling: keep the smallest set of highest-probability
-    /// tokens whose cumulative probability reaches `topp`, then sample within it.
-    fn sample_topp(&mut self, logits: &[f32], weight: &impl Fn(f32) -> f32, sum: f32) -> usize {
-        // Tokens below this probability cannot belong to the nucleus, so crop them
-        // before sorting. Holds whenever `topp >= 1/n`.
-        let cutoff = (1.0 - self.topp) / (logits.len() - 1) as f32;
-        self.probindex.clear();
-        for (i, &v) in logits.iter().enumerate() {
-            let p = weight(v) / sum;
-            if p >= cutoff {
-                self.probindex.push((p, i));
-            }
-        }
-        if self.probindex.is_empty() {
-            // `topp` smaller than 1/vocab cropped everything; fall back to greedy.
-            return argmax(logits);
-        }
-        // Highest probability first. `total_cmp` gives a total order (no NaN unwrap).
-        self.probindex.sort_unstable_by(|a, b| b.0.total_cmp(&a.0));
-
-        // Truncate where the cumulative probability first exceeds `topp`.
-        let mut cumulative = 0.0f32;
-        let mut last = self.probindex.len() - 1;
-        for (i, &(p, _)) in self.probindex.iter().enumerate() {
-            cumulative += p;
-            if cumulative > self.topp {
-                last = i;
-                break;
-            }
-        }
-
-        // Sample within the nucleus, renormalized by its cumulative mass.
-        let target = self.rng.random::<f32>() * cumulative;
-        let mut cdf = 0.0f32;
-        for &(p, idx) in &self.probindex[..=last] {
-            cdf += p;
-            if cdf > target {
-                return idx;
-            }
-        }
-        self.probindex[last].1 // f32 rounding fallback
-    }
+/// Resolve the sampling RNG seed: an explicit `--seed` for reproducibility, else one drawn
+/// from OS entropy. The engine's [`Sampler`] owns the PRNG itself (seeded from this); the
+/// host's `rand` is used here only to draw that seed from the OS (the engine's
+/// no-default-features `rand` carries no OS entropy of its own).
+pub(crate) fn resolve_seed(seed: Option<u64>) -> u64 {
+    seed.unwrap_or_else(rand::random)
 }
 
 /// Pick the matmul kernel from the flags, with a graceful fallback when `--dotprod`
@@ -388,29 +281,10 @@ mod tests {
     }
 
     #[test]
-    fn sampler_temperature_zero_is_greedy() {
-        let mut s = Sampler::new(4, 0.0, 0.0, Some(1));
-        assert_eq!(s.sample(&[0.1, 9.0, 0.2, 0.3]), 1);
-    }
-
-    #[test]
-    fn sampler_tiny_topp_collapses_to_top_token() {
-        // A near-zero topp shrinks the nucleus to the single most-probable token,
-        // so the draw is deterministic regardless of temperature or seed.
-        let logits = [1.0f32, 5.0, 2.0, 0.5];
-        let mut s = Sampler::new(4, 1.0, 1e-6, Some(123));
-        for _ in 0..8 {
-            assert_eq!(s.sample(&logits), 1);
-        }
-    }
-
-    #[test]
-    fn sampler_is_reproducible_with_a_seed() {
-        let logits = [1.0f32, 2.0, 0.5, 1.5, 3.0];
-        let draws = |seed| {
-            let mut s = Sampler::new(5, 1.0, 0.9, Some(seed));
-            (0..16).map(|_| s.sample(&logits)).collect::<Vec<_>>()
-        };
-        assert_eq!(draws(7), draws(7));
+    fn resolve_seed_prefers_an_explicit_seed() {
+        // An explicit --seed passes through unchanged (the reproducibility contract);
+        // without one, a seed is drawn from the OS (just check it returns something).
+        assert_eq!(resolve_seed(Some(42)), 42);
+        let _ = resolve_seed(None);
     }
 }

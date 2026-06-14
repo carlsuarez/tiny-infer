@@ -11,9 +11,6 @@ path = "src/lib.rs"
 
 [dependencies]
 libm = "0.2.16"
-
-[features]
-default = ["seq2seq"]
-# The Marian-style encoder-decoder (translation) path. Disable for a leaner
-# decoder-only build: `default-features = false` compiles just the Llama path.
-seq2seq = []
+# no_std PRNG for the sampler. `default-features = false` drops std / OS entropy so
+# the engine stays no_std; the host supplies the seed.
+rand = { version = "0.10.1", default-features = false }

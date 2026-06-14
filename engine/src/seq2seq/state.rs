@@ -1,4 +1,4 @@
-//! Working buffers for a seq2seq translation, carved from the [`Arena`] once.
+//! Working buffers for a seq2seq run, carved from the [`Arena`] once.
 //!
 //! [`RunState`] is the encoder-decoder counterpart of the Llama path's
 //! [`RunState`](crate::llama::state::RunState): every buffer the encoder and decoder
@@ -78,7 +78,7 @@ pub struct RunState<'buf> {
 }
 
 impl<'buf> RunState<'buf> {
-    /// Carve every buffer out of `arena` for a translation of up to `src_len`
+    /// Carve every buffer out of `arena` for a run of up to `src_len`
     /// source and `tgt_len` target tokens.
     ///
     /// Allocates in a fixed order summing to exactly
