@@ -44,7 +44,7 @@ OPTIONS:
     -t, --tokenizer <PATH>    Tokenizer path (alternative to the positional)
     -p, --prompt <TEXT>       Llama: text to continue · seq2seq: input sequence to transform
         --scalar              Use the scalar matmul kernels instead of the default
-                              core::simd ones (the readable reference path)
+                              SIMD ones (the readable reference path)
     -h, --help                Print this help and exit
 
   sampling (picks each generated token, Llama and seq2seq alike):

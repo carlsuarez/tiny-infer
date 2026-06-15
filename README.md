@@ -43,7 +43,7 @@ world!"` prints `Bonjour, le monde !`. The pieces:
   cache + decoder self-KV cache + per-step scratch). `scripts/export_marian.py` dumps
   a Hugging Face `MarianMTModel` to that format and emits the tokenizer artifact.
 * **Encoder + decoder** — allocation-free, arena-backed forward passes built from the
-  same `no_std` kernels, running on the scalar, `core::simd`, or hardware int8
+  same `no_std` kernels, running on the scalar, `wide` SIMD, or hardware int8
   dot-product kernels (`--scalar` selects the reference path; SIMD is the default, ~6×
   faster and bit-identical in its greedy output). Two correctness gates against Hugging
   Face transformers: the encoder's `last_hidden_state` matches to ~2e-6, and greedy
@@ -86,8 +86,9 @@ keeps the golden story opening.
 (the bulk of the work) have three implementations, selected per run via `engine::Kernel`:
 
 - **scalar** — the readable reference (`--scalar`).
-- **SIMD** — `core::simd` / `portable_simd`, 8-wide lanes (the default). Because
-  `core::simd` is nightly-only, the workspace pins a nightly toolchain (`rust-toolchain.toml`).
+- **SIMD** — portable 8-wide lanes via the [`wide`](https://crates.io/crates/wide) crate
+  (the default). `wide` is SIMD on **stable** Rust, so the workspace needs no nightly
+  toolchain or `core::simd`.
 - **dot-product** — for the int8 path, a hardware int8 dot-product kernel via `core::arch`
   intrinsics (`--dotprod`), one per architecture:
   - **x86 AVX-512 VNNI** (`vpdpbusd`): 32 int8 multiply-accumulates into `i32` per
@@ -260,7 +261,7 @@ cargo run --release -p host -- \
   --prompt "Once upon a time" --quantize --group-size 32
 ```
 
-The matmul kernels are SIMD (`core::simd`) by default; add `--scalar` for the readable
+The matmul kernels are SIMD (`wide`) by default; add `--scalar` for the readable
 reference kernels, or `--dotprod` to run int8 through the hardware dot-product kernel
 (x86 AVX-512 VNNI or ARM NEON `sdot`) — the fastest path on a CPU that has one (same
 output; see the table above).

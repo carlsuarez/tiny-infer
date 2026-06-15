@@ -36,7 +36,7 @@ pub fn run(path: &str, args: &Args) -> Result<(), HostError> {
         let tok_path = resolve_tokenizer(path, args)?;
         let tok = Tokenizer::load(&tok_path)?;
         // `--scalar` forces the reference kernels; `--dotprod` selects the int8 hardware
-        // kernel when generating quantized (and the CPU supports it); else `core::simd`.
+        // kernel when generating quantized (and the CPU supports it); else portable SIMD.
         let kernel = select_kernel(args.scalar, args.dotprod);
         // The shared sampler picks each token: greedy at temperature 0 (the default, and the
         // quality path for seq2seq), else temperature/top-p as on the Llama path.

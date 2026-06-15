@@ -6,9 +6,10 @@
 //! (`expf`, `powf`, `sinf`, `cosf`, `sqrtf`).
 //!
 //! The matrix–vector products — the bulk of the compute — come in two flavours: a
-//! straightforward **scalar** version and a **SIMD** version built on `core::simd`
-//! (the `portable_simd` feature). Both fp32 ([`matmul`] / [`matmul_simd`]) and
-//! int8-quantized ([`matmul_q8`] / [`matmul_q8_simd`]) matmuls have both. The scalar
+//! straightforward **scalar** version and a **SIMD** version built on the [`wide`] crate
+//! (portable SIMD vectors on stable Rust — no nightly `core::simd`). Both fp32
+//! ([`matmul`] / [`matmul_simd`]) and int8-quantized ([`matmul_q8`] / [`matmul_q8_simd`])
+//! matmuls have both. The scalar
 //! kernels are the readable reference; the SIMD kernels widen the inner dot product
 //! to 8 lanes of `f32` and fall back to scalar for any tail that does not fill a lane.
 //! The fp32 pair agree up to floating-point reassociation; the int8 pair agree
@@ -33,7 +34,7 @@ use crate::quant::{quantize_activation, QuantScratch, QuantizedTensor};
 /// Which matmul implementation a forward pass should use.
 ///
 /// Architecture-agnostic and orthogonal to the weight representation: every matmul
-/// has a scalar reference kernel and a `core::simd` kernel ([`matmul`]/[`matmul_simd`]
+/// has a scalar reference kernel and a [`wide`] SIMD kernel ([`matmul`]/[`matmul_simd`]
 /// for fp32, [`matmul_q8`]/[`matmul_q8_simd`] for int8), and the int8 path also has a
 /// hardware dot-product kernel. Both the Llama and seq2seq forward passes thread a
 /// `Kernel` through and dispatch their matmuls on it. The choice does not change token
@@ -42,7 +43,7 @@ use crate::quant::{quantize_activation, QuantScratch, QuantizedTensor};
 pub enum Kernel {
     /// Straightforward scalar kernels — the readable reference path.
     Scalar,
-    /// Vectorized `core::simd` kernels (8-wide `f32` lanes).
+    /// Vectorized [`wide`] kernels (8-wide lanes).
     Simd,
     /// Hardware int8 **dot-product** kernel ([`matmul_q8_dotprod`]) for the int8 path —
     /// x86 AVX-512 **VNNI** or ARM NEON **`sdot`**. The fp32 path always falls back to
@@ -52,8 +53,7 @@ pub enum Kernel {
     /// at runtime.
     Dotprod,
 }
-use core::simd::num::{SimdFloat, SimdInt};
-use core::simd::{f32x8, i32x8, i8x8};
+use wide::{f32x8, i32x8};
 
 #[cfg(target_arch = "x86_64")]
 use core::arch::x86_64::*;
@@ -63,6 +63,17 @@ use core::arch::aarch64::*;
 
 /// SIMD width (lanes) used by the vectorized matmuls.
 const LANES: usize = 8;
+
+/// Widen one 8-byte int8 chunk to `[i32; 8]` so it can fill an [`i32x8`] (`wide` has no
+/// i8 vector type, so the int8 matmul widens each chunk before the vectorized multiply).
+#[inline]
+fn widen_i8(chunk: &[i8]) -> [i32; LANES] {
+    let mut out = [0i32; LANES];
+    for (o, &v) in out.iter_mut().zip(chunk) {
+        *o = v as i32;
+    }
+    out
+}
 
 /// Byte width of an AVX2/AVX-512 256-bit int8 lane — the chunk size of the VNNI kernel.
 #[cfg(target_arch = "x86_64")]
@@ -79,7 +90,7 @@ const SDOT_LANES: usize = 16;
 /// in the checkpoint uses, so no transpose is ever needed.
 ///
 /// This is the readable reference implementation; [`matmul_simd`] computes the same
-/// product with `core::simd` and is selected on the hot path via [`crate::llama::Kernel`].
+/// product with [`wide`] SIMD and is selected on the hot path via [`crate::llama::Kernel`].
 ///
 /// # Panics
 /// In debug builds, if the slice lengths disagree with `d_in`/`d_out`.
@@ -113,22 +124,23 @@ pub fn matmul_simd(out: &mut [f32], x: &[f32], w: &[f32], d_in: usize, d_out: us
     debug_assert_eq!(x.len(), d_in);
     debug_assert_eq!(w.len(), d_in * d_out);
 
-    let chunks = d_in / LANES; // whole 8-wide lanes per row
     for (i, o) in out.iter_mut().enumerate() {
         let row = &w[i * d_in..][..d_in];
 
         // Widened multiply/accumulate over the lane-aligned head of the row.
+        let mut wj = row.chunks_exact(LANES);
+        let mut xj = x.chunks_exact(LANES);
         let mut acc = f32x8::splat(0.0);
-        for j in 0..chunks {
-            let vw = f32x8::from_slice(&row[j * LANES..][..LANES]);
-            let vx = f32x8::from_slice(&x[j * LANES..][..LANES]);
+        for (wc, xc) in wj.by_ref().zip(xj.by_ref()) {
+            let vw = f32x8::new(<[f32; LANES]>::try_from(wc).unwrap());
+            let vx = f32x8::new(<[f32; LANES]>::try_from(xc).unwrap());
             acc += vw * vx;
         }
-        let mut sum = acc.reduce_sum();
+        let mut sum = acc.reduce_add();
 
         // Scalar tail for the leftover < LANES columns.
-        for j in (chunks * LANES)..d_in {
-            sum += row[j] * x[j];
+        for (&wt, &xt) in wj.remainder().iter().zip(xj.remainder()) {
+            sum += wt * xt;
         }
         *o = sum;
     }
@@ -190,11 +202,11 @@ pub fn matmul_q8(
 
 /// SIMD W8A8 int8 matmul — the vectorized twin of [`matmul_q8`].
 ///
-/// Same int8×int8 → `i32` per-group dot product, widened to 8 lanes: the weight is
-/// loaded as `i8x8` and the (integer-valued) activation as `f32x8`, both `cast` to
-/// `i32x8`, multiplied, and accumulated in an `i32x8`; the lanes are reduced once per
-/// group and scaled by `w_scale · x_scale`. A scalar tail handles any `group_size % 8`
-/// remainder. Integer accumulation is associative, so unlike the fp32 SIMD kernel this
+/// Same int8×int8 → `i32` per-group dot product, widened to 8 lanes: each 8-byte chunk
+/// of the weight and the activation is widened from `i8` to `[i32; 8]` (`wide` has no i8
+/// vector), loaded into an `i32x8`, multiplied, and accumulated in an `i32x8`; the lanes
+/// are reduced once per group and scaled by `w_scale · x_scale`. A scalar tail handles any
+/// `group_size % 8` remainder. Integer accumulation is associative, so unlike the fp32 SIMD kernel this
 /// matches the scalar [`matmul_q8`] **exactly** (no reassociation error) as long as the
 /// `i32` group sum does not overflow — group sizes stay far below that bound.
 ///
@@ -217,7 +229,6 @@ pub fn matmul_q8_simd(
 
     let gs = qw.group_size;
     let groups_per_row = d_in / gs;
-    let chunks = gs / LANES; // whole 8-wide lanes per group
     for (i, o) in out.iter_mut().enumerate() {
         let row = &qw.data[i * d_in..][..d_in];
         let mut total = 0.0f32;
@@ -227,15 +238,16 @@ pub fn matmul_q8_simd(
             let xg = &xq[base..][..gs];
 
             // Per-group integer dot product: widen both i8 sides to i32, multiply, accumulate.
+            // `wide` has no i8 vector, so each 8-byte chunk is widened to an `i32x8`.
+            let mut wc = wg.chunks_exact(LANES);
+            let mut xc = xg.chunks_exact(LANES);
             let mut acc = i32x8::splat(0);
-            for c in 0..chunks {
-                let vw: i32x8 = i8x8::from_slice(&wg[c * LANES..][..LANES]).cast();
-                let vx: i32x8 = i8x8::from_slice(&xg[c * LANES..][..LANES]).cast();
-                acc += vw * vx;
+            for (w8, x8) in wc.by_ref().zip(xc.by_ref()) {
+                acc += i32x8::new(widen_i8(w8)) * i32x8::new(widen_i8(x8));
             }
-            let mut ival = acc.reduce_sum();
-            for k in (chunks * LANES)..gs {
-                ival += wg[k] as i32 * xg[k] as i32;
+            let mut ival = acc.reduce_add();
+            for (&wk, &xk) in wc.remainder().iter().zip(xc.remainder()) {
+                ival += wk as i32 * xk as i32;
             }
 
             total += ival as f32 * qw.scales[i * groups_per_row + g] * x_scale;
@@ -409,7 +421,7 @@ pub unsafe fn matmul_q8_dotprod(
 /// [`QuantizedTensor::layer`] first) on the kernel `kernel` selects:
 ///
 /// * [`Kernel::Scalar`] → [`matmul_q8`] (readable reference);
-/// * [`Kernel::Simd`] → [`matmul_q8_simd`] (portable `core::simd`);
+/// * [`Kernel::Simd`] → [`matmul_q8_simd`] (portable [`wide`] SIMD);
 /// * [`Kernel::Dotprod`] → the hardware dot-product kernel (x86 VNNI / ARM `sdot`), which
 ///   itself falls back to SIMD on group sizes / targets it cannot serve.
 ///

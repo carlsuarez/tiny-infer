@@ -14,3 +14,9 @@ libm = "0.2.16"
 # no_std PRNG for the sampler. `default-features = false` drops std / OS entropy so
 # the engine stays no_std; the host supplies the seed.
 rand = { version = "0.10.1", default-features = false }
+# Portable SIMD on stable Rust: `f32x8` / `i32x8` for the vectorized matmul kernels,
+# replacing `core::simd` (which would need the nightly `portable_simd` feature).
+# `default-features = false` drops wide's `std` feature so the engine stays no_std (we use
+# only arithmetic/reductions, no transcendentals); SIMD acceleration is cfg-gated, not
+# feature-gated, so it is unaffected.
+wide = { version = "1.5", default-features = false }

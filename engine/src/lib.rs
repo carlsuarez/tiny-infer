@@ -3,9 +3,10 @@
 //! `no_std`, allocation-free core of the tiny-infer transformer inference engine.
 //!
 //! This crate deliberately keeps its dependencies tiny and `no_std`: [`libm`] for the
-//! transcendental functions `core` lacks, and [`rand`] (no default features) for the
-//! sampler's seedable PRNG. The host crate (which *is* `std`) owns file IO, the byte→`f32`
-//! cast, the tokenizer, and the CLI.
+//! transcendental functions `core` lacks, [`rand`] (no default features) for the
+//! sampler's seedable PRNG, and [`wide`] for portable SIMD vectors on stable Rust. The
+//! host crate (which *is* `std`) owns file IO, the byte→`f32` cast, the tokenizer, and
+//! the CLI.
 //!
 //! ## Structure: a shared core plus two architectures
 //!
@@ -43,9 +44,10 @@
 //!
 //! # `no_std` and panic policy
 //!
-//! The crate compiles against `core` plus two `no_std` crates — [`libm`] (for the
-//! transcendental functions `core` lacks) and [`rand`] (the sampler PRNG, no default
-//! features so it pulls in no `std`/OS entropy). It is verified on a bare-metal target two ways: the library
+//! The crate compiles against `core` plus three `no_std` crates — [`libm`] (for the
+//! transcendental functions `core` lacks), [`rand`] (the sampler PRNG, no default
+//! features so it pulls in no `std`/OS entropy), and [`wide`] (portable SIMD vectors on
+//! stable Rust, so the vectorized matmuls need no nightly `core::simd`). It is verified on a bare-metal target two ways: the library
 //! itself (`cargo build -p engine --target thumbv7em-none-eabi`) and a freestanding
 //! firmware binary that supplies its own `#[panic_handler]` and runs a full forward pass
 //! out of stack buffers with no allocator (`examples/baremetal.rs`). Because every
@@ -68,9 +70,6 @@
 //! sets it), needing no unwinder.
 
 #![no_std]
-// The SIMD matmul kernels in `math` use `core::simd`, which is still nightly-only;
-// the workspace pins a nightly toolchain (see `rust-toolchain.toml`).
-#![feature(portable_simd)]
 #![forbid(unsafe_op_in_unsafe_fn)]
 #![warn(missing_docs)]
 
