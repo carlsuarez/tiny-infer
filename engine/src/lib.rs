@@ -16,6 +16,8 @@
 //! * [`arena`] — the bump [`Arena`] that backs every working buffer.
 //! * [`error`] — the crate-wide [`EngineError`].
 //! * [`math`] — the fp32 and int8 compute kernels (matmul, norms, attention, …).
+//! * [`nn`] — the 1-D CNN kernels ([`conv1d`](nn::conv1d), [`relu`](nn::relu),
+//!   [`global_avg_pool`](nn::global_avg_pool)) a feature-window classifier is built from.
 //! * [`quant`] — the group-wise int8 quantization *primitives* ([`QuantizedTensor`]
 //!   and the quantize/dequantize routines the kernels operate on).
 //! * [`sample`] — the [`Sampler`] that turns a logits row into the next token id
@@ -76,6 +78,7 @@
 pub mod arena;
 pub mod error;
 pub mod math;
+pub mod nn;
 pub mod quant;
 pub mod sample;
 
