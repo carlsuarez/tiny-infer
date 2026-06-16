@@ -80,7 +80,7 @@ impl Sampler {
     /// In debug builds, if top-p sampling is active and `scratch` is shorter than `logits`.
     pub fn sample(&mut self, logits: &[f32], scratch: &mut [ProbIndex]) -> usize {
         if self.temperature == 0.0 {
-            return argmax(logits);
+            return argmax(logits).0;
         }
 
         // Unnormalized softmax weight of one logit (max-shifted for stability). Captured by
@@ -140,7 +140,7 @@ impl Sampler {
         }
         if n == 0 {
             // `topp` smaller than 1/vocab cropped everything; fall back to greedy.
-            return argmax(logits);
+            return argmax(logits).0;
         }
         let nucleus = &mut scratch[..n];
         // Highest probability first. `total_cmp` gives a total order (no NaN unwrap).

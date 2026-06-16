@@ -792,7 +792,7 @@ pub fn add_bias(out: &mut [f32], bias: &[f32]) {
 ///
 /// # Panics
 /// In debug builds, if `buf` is empty.
-pub fn argmax(buf: &[f32]) -> usize {
+pub fn argmax(buf: &[f32]) -> (usize, f32) {
     debug_assert!(!buf.is_empty());
 
     let mut best = 0;
@@ -803,7 +803,7 @@ pub fn argmax(buf: &[f32]) -> usize {
             best = i;
         }
     }
-    best
+    (best, best_val)
 }
 
 #[cfg(test)]
@@ -1073,11 +1073,11 @@ mod tests {
 
     #[test]
     fn argmax_picks_max_and_first_on_ties() {
-        assert_eq!(argmax(&[0.1, 0.7, 0.2]), 1);
-        assert_eq!(argmax(&[5.0]), 0);
+        assert_eq!(argmax(&[0.1, 0.7, 0.2]).0, 1);
+        assert_eq!(argmax(&[5.0]).0, 0);
         // Ties resolve to the earliest index (strict `>`).
-        assert_eq!(argmax(&[2.0, 2.0, 1.0, 2.0]), 0);
-        assert_eq!(argmax(&[-3.0, -1.0, -1.0]), 1);
+        assert_eq!(argmax(&[2.0, 2.0, 1.0, 2.0]).0, 0);
+        assert_eq!(argmax(&[-3.0, -1.0, -1.0]).0, 1);
     }
 
     #[test]

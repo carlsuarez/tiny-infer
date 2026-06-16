@@ -317,7 +317,15 @@ pub fn encode<'s>(
         let (bq, bo) = (layer(kept.enc_bq, l, d), layer(kept.enc_bo, l, d));
         for qi in 0..n {
             let base = qi * d;
-            mw.matmul(Proj::EncWq, l, s.q, &s.enc_x[base..base + d], c, kernel, qs.as_mut());
+            mw.matmul(
+                Proj::EncWq,
+                l,
+                s.q,
+                &s.enc_x[base..base + d],
+                c,
+                kernel,
+                qs.as_mut(),
+            );
             math::add_bias(s.q, bq);
             for h in 0..heads {
                 let off = h * hd;
@@ -351,7 +359,10 @@ pub fn encode<'s>(
         // Residual + LayerNorm (post-norm): h = LN(h + attn_out). Folding the
         // residual into `enc_sub` lets LayerNorm read it and write `enc_x` without
         // aliasing (the two are distinct buffers).
-        let (ln_w, ln_b) = (layer(kept.enc_ln_att_w, l, d), layer(kept.enc_ln_att_b, l, d));
+        let (ln_w, ln_b) = (
+            layer(kept.enc_ln_att_w, l, d),
+            layer(kept.enc_ln_att_b, l, d),
+        );
         for t in 0..n {
             let base = t * d;
             math::accumulate(&mut s.enc_sub[base..base + d], &s.enc_x[base..base + d]);
@@ -364,12 +375,26 @@ pub fn encode<'s>(
         }
 
         // --- feed-forward sublayer (position-wise) ---
-        let (fc1_b, fc2_b) = (layer(kept.enc_fc1_b, l, c.enc_ffn), layer(kept.enc_fc2_b, l, d));
-        let (lnf_w, lnf_b) = (layer(kept.enc_ln_ffn_w, l, d), layer(kept.enc_ln_ffn_b, l, d));
+        let (fc1_b, fc2_b) = (
+            layer(kept.enc_fc1_b, l, c.enc_ffn),
+            layer(kept.enc_fc2_b, l, d),
+        );
+        let (lnf_w, lnf_b) = (
+            layer(kept.enc_ln_ffn_w, l, d),
+            layer(kept.enc_ln_ffn_b, l, d),
+        );
         for t in 0..n {
             let base = t * d;
             let hbuf = &mut s.ffn[..c.enc_ffn];
-            mw.matmul(Proj::EncFc1, l, hbuf, &s.enc_x[base..base + d], c, kernel, qs.as_mut());
+            mw.matmul(
+                Proj::EncFc1,
+                l,
+                hbuf,
+                &s.enc_x[base..base + d],
+                c,
+                kernel,
+                qs.as_mut(),
+            );
             math::add_bias(hbuf, fc1_b);
             activate(hbuf, c.activation);
             mw.matmul(
@@ -414,7 +439,10 @@ pub fn precompute_cross_kv(
 ) {
     let d = c.d_model;
     for l in 0..c.dec_layers {
-        let (bk, bv) = (layer(kept.dec_cross_bk, l, d), layer(kept.dec_cross_bv, l, d));
+        let (bk, bv) = (
+            layer(kept.dec_cross_bk, l, d),
+            layer(kept.dec_cross_bv, l, d),
+        );
         let lbase = l * src_len * d; // src_len is constant for the whole decode
         for t in 0..src_len {
             let off = lbase + t * d;
@@ -543,15 +571,29 @@ pub fn decode_step<'s>(
 
         // Output projection, residual + LayerNorm. `enc_sub[..d]` is free here
         // (encoder + cross-KV precompute are done) and serves as sublayer scratch.
-        mw.matmul(Proj::DecWo, l, &mut s.enc_sub[..d], &s.attn[..], c, kernel, qs.as_mut());
+        mw.matmul(
+            Proj::DecWo,
+            l,
+            &mut s.enc_sub[..d],
+            &s.attn[..],
+            c,
+            kernel,
+            qs.as_mut(),
+        );
         math::add_bias(&mut s.enc_sub[..d], bo);
         math::accumulate(&mut s.enc_sub[..d], &s.x[..d]);
-        let (ln_w, ln_b) = (layer(kept.dec_ln_self_w, l, d), layer(kept.dec_ln_self_b, l, d));
+        let (ln_w, ln_b) = (
+            layer(kept.dec_ln_self_w, l, d),
+            layer(kept.dec_ln_self_b, l, d),
+        );
         math::layernorm(&mut s.x[..d], &s.enc_sub[..d], ln_w, ln_b);
 
         // --- cross-attention sublayer ---
         // Q from the decoder state; K/V precomputed from the encoder output.
-        let (bq, bo) = (layer(kept.dec_cross_bq, l, d), layer(kept.dec_cross_bo, l, d));
+        let (bq, bo) = (
+            layer(kept.dec_cross_bq, l, d),
+            layer(kept.dec_cross_bo, l, d),
+        );
         let cross_base = l * src_len * d;
 
         mw.matmul(Proj::DecCrossWq, l, s.q, &s.x[..d], c, kernel, qs.as_mut());
@@ -574,15 +616,32 @@ pub fn decode_step<'s>(
             );
         }
 
-        mw.matmul(Proj::DecCrossWo, l, &mut s.enc_sub[..d], &s.attn[..], c, kernel, qs.as_mut());
+        mw.matmul(
+            Proj::DecCrossWo,
+            l,
+            &mut s.enc_sub[..d],
+            &s.attn[..],
+            c,
+            kernel,
+            qs.as_mut(),
+        );
         math::add_bias(&mut s.enc_sub[..d], bo);
         math::accumulate(&mut s.enc_sub[..d], &s.x[..d]);
-        let (ln_w, ln_b) = (layer(kept.dec_ln_cross_w, l, d), layer(kept.dec_ln_cross_b, l, d));
+        let (ln_w, ln_b) = (
+            layer(kept.dec_ln_cross_w, l, d),
+            layer(kept.dec_ln_cross_b, l, d),
+        );
         math::layernorm(&mut s.x[..d], &s.enc_sub[..d], ln_w, ln_b);
 
         // --- feed-forward sublayer (post-norm) ---
-        let (fc1_b, fc2_b) = (layer(kept.dec_fc1_b, l, c.dec_ffn), layer(kept.dec_fc2_b, l, d));
-        let (lnf_w, lnf_b) = (layer(kept.dec_ln_ffn_w, l, d), layer(kept.dec_ln_ffn_b, l, d));
+        let (fc1_b, fc2_b) = (
+            layer(kept.dec_fc1_b, l, c.dec_ffn),
+            layer(kept.dec_fc2_b, l, d),
+        );
+        let (lnf_w, lnf_b) = (
+            layer(kept.dec_ln_ffn_w, l, d),
+            layer(kept.dec_ln_ffn_b, l, d),
+        );
 
         let hbuf = &mut s.ffn[..c.dec_ffn];
         mw.matmul(Proj::DecFc1, l, hbuf, &s.x[..d], c, kernel, qs.as_mut());
@@ -639,7 +698,7 @@ pub fn greedy_decode(
     let mut n = 0;
     for (pos, slot) in out_ids.iter_mut().enumerate() {
         let logits = decode_step(c, mw, kept, s, token, pos, src_ids.len(), kernel, qs);
-        let next = math::argmax(logits);
+        let (next, _) = math::argmax(logits);
         if next == c.eos_id {
             break;
         }
@@ -782,7 +841,7 @@ mod tests {
             let src = [1usize, 5, 2, 7];
             let a = decode_ids(&c, &wbuf, &src, Kernel::Simd);
             assert_eq!(a, decode_ids(&c, &wbuf, &src, Kernel::Simd)); // deterministic
-            // The SIMD and scalar kernels pick the same greedy tokens.
+                                                                      // The SIMD and scalar kernels pick the same greedy tokens.
             assert_eq!(a, decode_ids(&c, &wbuf, &src, Kernel::Scalar));
             assert!(a.len() <= c.max_tgt);
             assert!(a.iter().all(|&t| t < c.vocab_size));
@@ -803,7 +862,17 @@ mod tests {
         let mut s = RunState::new(&mut arena, &c, src.len(), c.max_tgt).unwrap();
         encode(&c, &mw, &kept, &mut s, &src, Kernel::Simd, &mut None);
         precompute_cross_kv(&c, &mw, &kept, &mut s, src.len(), Kernel::Simd, &mut None);
-        let logits = decode_step(&c, &mw, &kept, &mut s, c.pad_id, 0, src.len(), Kernel::Simd, &mut None);
+        let logits = decode_step(
+            &c,
+            &mw,
+            &kept,
+            &mut s,
+            c.pad_id,
+            0,
+            src.len(),
+            Kernel::Simd,
+            &mut None,
+        );
         assert_eq!(logits.len(), c.vocab_size);
         assert!(logits.iter().all(|x| x.is_finite()));
     }
@@ -843,7 +912,18 @@ mod tests {
             let mut s = RunState::new(&mut arena, &c, src.len(), c.max_tgt).unwrap();
             encode(&c, mw, kept, &mut s, &src, kernel, &mut qs);
             precompute_cross_kv(&c, mw, kept, &mut s, src.len(), kernel, &mut qs);
-            decode_step(&c, mw, kept, &mut s, c.pad_id, 0, src.len(), kernel, &mut qs).to_vec()
+            decode_step(
+                &c,
+                mw,
+                kept,
+                &mut s,
+                c.pad_id,
+                0,
+                src.len(),
+                kernel,
+                &mut qs,
+            )
+            .to_vec()
         };
 
         let fp32 = Weights::new(&wbuf, &c).unwrap();
