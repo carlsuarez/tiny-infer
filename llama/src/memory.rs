@@ -7,7 +7,7 @@
 //! The layout mirrors llama2.c's `RunState`: a set of activation scratch buffers
 //! plus the KV cache. The KV cache dominates and grows with `n_layers * seq_len`.
 
-use crate::llama::config::Config;
+use crate::config::Config;
 
 const F32: usize = core::mem::size_of::<f32>();
 
@@ -25,7 +25,7 @@ const F32: usize = core::mem::size_of::<f32>();
 /// | `logits`| `vocab`     | output distribution                    |
 ///
 /// The int8 (W8A8) path's activation scratch is *not* part of this arena — it lives in a
-/// separate, caller-owned [`QuantScratch`](crate::llama::QuantScratch), so an fp32 run budgets
+/// separate, caller-owned [`QuantScratch`](engine::QuantScratch), so an fp32 run budgets
 /// none of it.
 pub const fn activation_floats(c: &Config) -> usize {
     let att_dim = c.n_heads * c.head_size();
@@ -37,7 +37,7 @@ pub const fn activation_floats(c: &Config) -> usize {
 }
 
 /// The largest matmul input dimension `d_in` across all projections — the size each
-/// buffer of the W8A8 activation scratch ([`QuantScratch`](crate::llama::QuantScratch)) must
+/// buffer of the W8A8 activation scratch ([`QuantScratch`](engine::QuantScratch)) must
 /// cover.
 pub const fn max_proj_d_in(c: &Config) -> usize {
     let att_dim = c.n_heads * c.head_size();

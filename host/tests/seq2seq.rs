@@ -8,8 +8,8 @@
 use std::path::PathBuf;
 use std::process::Command;
 
-use engine::seq2seq::config::{SEQ2SEQ_HEADER_BYTES, SEQ2SEQ_VERSION};
-use engine::seq2seq::{weight_floats, Activation, Config as Seq2SeqConfig};
+use seq2seq::config::{SEQ2SEQ_HEADER_BYTES, SEQ2SEQ_VERSION};
+use seq2seq::{weight_floats, Activation, Config as Seq2SeqConfig};
 
 const BIN: &str = env!("CARGO_BIN_EXE_tiny-infer");
 

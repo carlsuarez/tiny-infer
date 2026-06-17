@@ -13,8 +13,8 @@ use std::fs::File;
 use std::io::Read;
 use std::path::{Path, PathBuf};
 
-use engine::seq2seq::config::{is_seq2seq, SEQ2SEQ_HEADER_BYTES};
-use engine::seq2seq::{expected_file_bytes, Config as Seq2SeqConfig, Weights};
+use seq2seq::config::{is_seq2seq, SEQ2SEQ_HEADER_BYTES};
+use seq2seq::{expected_file_bytes, Config as Seq2SeqConfig, Weights};
 
 use crate::error::HostError;
 

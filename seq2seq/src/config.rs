@@ -32,9 +32,9 @@
 //!
 //! All `i32` fields must be positive except the three token ids, which must lie
 //! in `0..vocab_size`. The fp32 weight payload that follows the header is
-//! documented in [`crate::seq2seq::weights`].
+//! documented in [`crate::weights`].
 
-use crate::error::{EngineError, Seq2SeqField};
+use engine::error::{EngineError, Seq2SeqField};
 
 /// Size of the seq2seq on-disk header: magic, version, fields, flags, padding.
 pub const SEQ2SEQ_HEADER_BYTES: usize = 256;
@@ -118,7 +118,7 @@ impl Config {
     /// bytes.
     ///
     /// Only the first [`SEQ2SEQ_HEADER_BYTES`] are read; the weight payload is
-    /// carved separately (see [`crate::seq2seq::weights`]). Returns
+    /// carved separately (see [`crate::weights`]). Returns
     /// [`EngineError::NotSeq2Seq`] if the magic is absent (so a caller can fall
     /// back to other formats), [`EngineError::HeaderTooShort`] /
     /// [`EngineError::UnsupportedVersion`] for a damaged or newer file, and
@@ -292,7 +292,7 @@ mod tests {
     fn rejects_wrong_magic() {
         // A llama2.c versioned header must not parse as seq2seq.
         let mut bytes = header(OPUS_EN_FR, OPUS_FLAGS);
-        bytes[0..4].copy_from_slice(&crate::llama::config::MAGIC.to_le_bytes());
+        bytes[0..4].copy_from_slice(&llama::config::MAGIC.to_le_bytes());
         assert_eq!(Config::parse(&bytes).unwrap_err(), EngineError::NotSeq2Seq);
         assert!(!is_seq2seq(&bytes));
         assert!(is_seq2seq(&header(OPUS_EN_FR, OPUS_FLAGS)));

@@ -1,6 +1,6 @@
 [package]
 name = "engine"
-description = "no_std core for tiny-infer: model config, weight layout, arena allocator"
+description = "no_std shared core for tiny-infer: arena allocator, compute/quant kernels, sampler"
 version.workspace = true
 edition.workspace = true
 license.workspace = true

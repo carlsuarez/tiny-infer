@@ -1,11 +1,11 @@
 //! Working buffers for a seq2seq run, carved from the [`Arena`] once.
 //!
 //! [`RunState`] is the encoder-decoder counterpart of the Llama path's
-//! [`RunState`](crate::llama::state::RunState): every buffer the encoder and decoder
+//! `RunState`: every buffer the encoder and decoder
 //! forward passes read or write is allocated up front from a single
 //! caller-provided [`Arena`], so the passes themselves allocate nothing. The
 //! total is exactly
-//! [`seq2seq_arena_floats`](crate::seq2seq::memory::seq2seq_arena_floats), and the
+//! [`seq2seq_arena_floats`](crate::memory::seq2seq_arena_floats), and the
 //! four field groups below mirror that budget's four groups:
 //!
 //! * **encoder buffers** — the encoder's self-attention is all-to-all, so every
@@ -19,16 +19,16 @@
 //! * **step scratch** — the single-position working set shared by the encoder's
 //!   per-position loops and the decoder step.
 //!
-//! [`Arena`]: crate::Arena
+//! [`Arena`]: engine::Arena
 
-use crate::arena::Arena;
-use crate::error::EngineError;
-use crate::seq2seq::config::Config;
+use engine::arena::Arena;
+use engine::error::EngineError;
+use crate::config::Config;
 
 /// Every mutable buffer the encoder and decoder forward passes use.
 ///
 /// Each field borrows a disjoint sub-slice of one arena block (`'buf`); as with
-/// [`RunState`](crate::llama::state::RunState), [`Arena::alloc`] ties the slices to the
+/// `RunState`, [`Arena::alloc`] ties the slices to the
 /// block's lifetime, not the arena borrow, so they coexist. Buffer sizes come
 /// straight from [`Config`] and the source/target lengths.
 #[derive(Debug)]
@@ -82,7 +82,7 @@ impl<'buf> RunState<'buf> {
     /// source and `tgt_len` target tokens.
     ///
     /// Allocates in a fixed order summing to exactly
-    /// [`seq2seq_arena_floats`](crate::seq2seq::memory::seq2seq_arena_floats);
+    /// [`seq2seq_arena_floats`](crate::memory::seq2seq_arena_floats);
     /// size the arena with that function. Returns [`EngineError::ArenaOverflow`]
     /// if it is too small. Pass `tgt_len = 0` to size an encode-only state (the
     /// decoder caches become empty slices).
@@ -129,8 +129,8 @@ impl<'buf> RunState<'buf> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::seq2seq::config::Activation;
-    use crate::seq2seq::memory::seq2seq_arena_floats;
+    use crate::config::Activation;
+    use crate::memory::seq2seq_arena_floats;
 
     extern crate std;
     use std::vec;

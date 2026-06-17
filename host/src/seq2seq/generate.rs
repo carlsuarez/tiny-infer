@@ -5,9 +5,9 @@
 
 use std::time::Instant;
 
-use engine::seq2seq::memory::seq2seq_arena_floats;
-use engine::seq2seq::quantize::max_proj_d_in;
-use engine::seq2seq::{
+use seq2seq::memory::seq2seq_arena_floats;
+use seq2seq::quantize::max_proj_d_in;
+use seq2seq::{
     decode_step, encode, precompute_cross_kv, Config, KeptWeights, ModelWeights, RunState,
 };
 use engine::sample::ProbIndex;

@@ -19,13 +19,13 @@
 //!   an `i32` version, the same seven `i32` fields (with `vocab_size` always
 //!   positive), a `u8` shared-classifier flag, and — v2 only — the `i32`
 //!   quantization group size; the rest is zero padding. v1 stores fp32 weights
-//!   (in a different order from legacy, see [`crate::llama::weights`]); v2 stores the
+//!   (in a different order from legacy, see [`crate::weights`]); v2 stores the
 //!   matmul weights pre-quantized to int8 (`runq.c`'s Q8_0 format).
 //!
 //! The detected variant is reported as a [`ModelFormat`], which the loader uses to
 //! pick the weight layout and validate the file size.
 
-use crate::error::{ConfigField, EngineError};
+use engine::error::{ConfigField, EngineError};
 
 /// Number of bytes in the legacy on-disk config header: seven `i32` fields.
 pub const HEADER_BYTES: usize = 7 * 4;
@@ -39,8 +39,8 @@ pub const VERSIONED_HEADER_BYTES: usize = 256;
 pub const MAGIC: u32 = 0x616b_3432;
 
 /// Whether `bytes` look like a llama2.c checkpoint of any supported format — the
-/// counterpart of [`is_seq2seq`](crate::seq2seq::config::is_seq2seq) for routing a
-/// file to this architecture.
+/// counterpart of `seq2seq::config::is_seq2seq` for routing a file to this
+/// architecture.
 ///
 /// Two positive signals:
 /// * a versioned (v1/v2) file opens with the [`MAGIC`] `"ak42"`;
@@ -177,7 +177,7 @@ impl Config {
     /// which detects the versioned formats and falls back to this.
     ///
     /// Only the first [`HEADER_BYTES`] are read; trailing weight data is ignored
-    /// here (see [`crate::llama::weights`]). Returns [`EngineError::HeaderTooShort`] if
+    /// here (see [`crate::weights`]). Returns [`EngineError::HeaderTooShort`] if
     /// `bytes` is too small, or [`EngineError::InvalidConfig`] if a field is
     /// unusable.
     pub fn parse(bytes: &[u8]) -> Result<Config, EngineError> {

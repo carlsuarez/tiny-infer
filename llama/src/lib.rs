@@ -1,11 +1,11 @@
 //! Decoder-only **Llama-2** architecture: the llama2.c-compatible path.
 //!
-//! This is the engine's first and reference architecture — a causal,
-//! decoder-only transformer (TinyStories / Llama-2-style checkpoints) whose
-//! greedy output must stay bit-for-bit identical to Karpathy's llama2.c. It is
-//! always compiled in (unlike the optional [`seq2seq`](crate::seq2seq) path) and
-//! defines the public crate-root API: [`Config`], [`Weights`], [`forward`], and
-//! friends are all re-exported from here at the crate root.
+//! A standalone `no_std`, allocation-free crate that builds the decoder-only
+//! transformer (TinyStories / Llama-2-style checkpoints) on top of the shared
+//! [`engine`] core — its bump [`Arena`](engine::Arena), the [`math`](engine::math)
+//! kernels, and the int8 [`quant`](engine::quant) primitives. Greedy output stays
+//! bit-for-bit identical to Karpathy's llama2.c. The public API — [`Config`],
+//! [`Weights`], [`forward`], and friends — is re-exported here at the crate root.
 //!
 //! A Llama-2 layer is RMSNorm (gain only, no bias) → causal GQA self-attention
 //! with RoPE position encoding → SwiGLU feed-forward, all pre-norm, with the token
@@ -13,8 +13,8 @@
 //! binary formats (legacy v1 and the quantized `runq.c` v2), parsed by [`config`]
 //! and [`weights`].
 //!
-//! Everything here builds on the shared core — the bump [`Arena`](crate::Arena),
-//! the [`math`](crate::math) kernels, and the int8 [`quant`](crate::quant)
+//! Everything here builds on the shared core — the bump [`Arena`](engine::Arena),
+//! the [`math`](engine::math) kernels, and the int8 [`quant`](engine::quant)
 //! primitives — which it shares with the seq2seq path. What is specific to this
 //! architecture lives here:
 //!
@@ -27,7 +27,11 @@
 //! * [`model`] — [`forward`] (the per-token forward pass over fp32 *or* int8
 //!   weights via [`ModelWeights`]) and the [`Kernel`] selector.
 //! * [`quantize`] — int8 quantization of the Llama weight set ([`QuantizedWeights`],
-//!   [`quantize_weights`]), layered on the shared [`quant`](crate::quant) primitives.
+//!   [`quantize_weights`]), layered on the shared [`quant`](engine::quant) primitives.
+
+#![no_std]
+#![forbid(unsafe_op_in_unsafe_fn)]
+#![warn(missing_docs)]
 
 pub mod config;
 pub mod memory;
@@ -37,10 +41,10 @@ pub mod state;
 pub mod weights;
 
 pub use config::{parse_header, Config, ModelFormat};
-pub use crate::math::Kernel;
+pub use engine::math::Kernel;
 pub use memory::{arena_floats, MemoryBudget};
 pub use model::{forward, ModelWeights};
-pub use crate::quant::QuantScratch;
+pub use engine::quant::QuantScratch;
 pub use quantize::{quantize_weights, QuantizedWeights};
 pub use state::RunState;
 pub use weights::Weights;

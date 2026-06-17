@@ -12,12 +12,12 @@
 //! feed-forward + residual. After the last layer: a final RMSNorm and the classifier
 //! projection to vocabulary logits.
 
-use crate::llama::config::Config;
-use crate::llama::quantize::QuantizedWeights;
-use crate::llama::state::RunState;
-use crate::llama::weights::Weights;
-use crate::math::{self, Kernel};
-use crate::quant::{QuantScratch, QuantizedTensor};
+use crate::config::Config;
+use crate::quantize::QuantizedWeights;
+use crate::state::RunState;
+use crate::weights::Weights;
+use engine::math::{self, Kernel};
+use engine::quant::{QuantScratch, QuantizedTensor};
 
 /// Which projection weight a [`ModelWeights::matmul`] call should apply.
 ///
@@ -84,7 +84,7 @@ impl<'a> ModelWeights<'a> {
             }
             ModelWeights::Q8(w) => {
                 let row = w.token_embedding.layer(token, 1, dim);
-                crate::quant::dequantize(out, &row);
+                engine::quant::dequantize(out, &row);
             }
         }
     }
@@ -286,8 +286,8 @@ pub fn forward<'s>(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::arena::Arena;
-    use crate::llama::weights::weight_floats;
+    use engine::arena::Arena;
+    use crate::weights::weight_floats;
 
     extern crate std;
     use std::vec;
@@ -330,7 +330,7 @@ mod tests {
         let wbuf = fake_weights(&c);
         let w = ModelWeights::F32(Weights::new(&wbuf, &c).unwrap());
 
-        let mut arena_buf = vec![0.0f32; crate::llama::memory::arena_floats(&c)];
+        let mut arena_buf = vec![0.0f32; crate::memory::arena_floats(&c)];
         let mut arena = Arena::new(&mut arena_buf);
         let mut s = RunState::new(&mut arena, &c).unwrap();
 
@@ -351,7 +351,7 @@ mod tests {
         let tokens = [1usize, 5, 2, 7];
 
         let run = |toks: &[usize]| -> Vec<Vec<f32>> {
-            let mut arena_buf = vec![0.0f32; crate::llama::memory::arena_floats(&c)];
+            let mut arena_buf = vec![0.0f32; crate::memory::arena_floats(&c)];
             let mut arena = Arena::new(&mut arena_buf);
             let mut s = RunState::new(&mut arena, &c).unwrap();
             let mut out = Vec::new();
@@ -376,7 +376,7 @@ mod tests {
         let w = ModelWeights::F32(Weights::new(&wbuf, &c).unwrap());
 
         let run_pair = |first: usize| -> Vec<f32> {
-            let mut arena_buf = vec![0.0f32; crate::llama::memory::arena_floats(&c)];
+            let mut arena_buf = vec![0.0f32; crate::memory::arena_floats(&c)];
             let mut arena = Arena::new(&mut arena_buf);
             let mut s = RunState::new(&mut arena, &c).unwrap();
             forward(&c, &w, &mut s, first, 0, Kernel::Simd, &mut None);
@@ -390,7 +390,7 @@ mod tests {
     fn forward_q8_tracks_fp32() {
         // Quantizing the eight matmul weights must not change the answer's scale: the
         // int8 logits track the fp32 logits closely for the same input.
-        use crate::llama::quantize::{
+        use crate::quantize::{
             quantize_weights, quantized_scale_count, quantized_weight_count,
         };
 
@@ -418,10 +418,10 @@ mod tests {
         let q8_w = ModelWeights::Q8(qw);
 
         let logits = |w: &ModelWeights, kernel: Kernel| -> Vec<f32> {
-            let mut arena_buf = vec![0.0f32; crate::llama::memory::arena_floats(&c)];
+            let mut arena_buf = vec![0.0f32; crate::memory::arena_floats(&c)];
             let mut arena = Arena::new(&mut arena_buf);
             let mut s = RunState::new(&mut arena, &c).unwrap();
-            let n = crate::llama::memory::max_proj_d_in(&c);
+            let n = crate::memory::max_proj_d_in(&c);
             let (mut xq, mut sc, mut gs) = (vec![0i8; n], vec![0.0f32; n], vec![0.0f32; n]);
             let scratch = QuantScratch::new(&mut xq, &mut sc, &mut gs, n).unwrap();
             let mut qs = matches!(w, ModelWeights::Q8(_)).then_some(scratch);
@@ -450,7 +450,7 @@ mod tests {
         // The SIMD kernels differ from scalar only by floating-point reassociation,
         // so the full-forward logits must match to within rounding for both the fp32
         // and int8 representations.
-        use crate::llama::quantize::{
+        use crate::quantize::{
             quantize_weights, quantized_scale_count, quantized_weight_count,
         };
 
@@ -474,10 +474,10 @@ mod tests {
         .unwrap();
 
         let run = |w: &ModelWeights, kernel: Kernel| -> Vec<f32> {
-            let mut arena_buf = vec![0.0f32; crate::llama::memory::arena_floats(&c)];
+            let mut arena_buf = vec![0.0f32; crate::memory::arena_floats(&c)];
             let mut arena = Arena::new(&mut arena_buf);
             let mut s = RunState::new(&mut arena, &c).unwrap();
-            let n = crate::llama::memory::max_proj_d_in(&c);
+            let n = crate::memory::max_proj_d_in(&c);
             let (mut xq, mut sc, mut gs) = (vec![0i8; n], vec![0.0f32; n], vec![0.0f32; n]);
             let scratch = QuantScratch::new(&mut xq, &mut sc, &mut gs, n).unwrap();
             let mut qs = matches!(w, ModelWeights::Q8(_)).then_some(scratch);

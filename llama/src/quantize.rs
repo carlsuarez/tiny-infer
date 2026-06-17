@@ -1,6 +1,6 @@
 //! Int8 quantization of the Llama weight set.
 //!
-//! Builds on the shared [`crate::quant`] primitives ([`QuantizedTensor`],
+//! Builds on the shared [`engine::quant`] primitives ([`QuantizedTensor`],
 //! [`quantize`]) to quantize the matmul-heavy matrices of a decoder-only
 //! checkpoint, cutting their memory footprint ~4×. Only the RMSNorm gains
 //! (`rms_att`, `rms_ffn`, `rms_final`) stay `f32` — they are 1-D and tiny.
@@ -9,9 +9,9 @@
 //! * the seven layer projections `wq, wk, wv, wo, w1, w2, w3`, and
 //! * the `token_embedding` table, which doubles as the `wcls` classifier when the
 //!   checkpoint shares weights. It is stored **once** as int8: the classifier reads
-//!   it as a matmul ([`matmul_q8`](crate::math::matmul_q8)), and the embedding lookup
+//!   it as a matmul ([`matmul_q8`](engine::math::matmul_q8)), and the embedding lookup
 //!   dequantizes just the one row it needs ([`QuantizedTensor::layer`] +
-//!   [`dequantize`](crate::quant::dequantize)). When weights are not shared, `wcls`
+//!   [`dequantize`](engine::quant::dequantize)). When weights are not shared, `wcls`
 //!   is a second quantized table.
 //!
 //! Storing the embedding once as int8 — instead of keeping a full fp32 copy just for
@@ -30,10 +30,10 @@
 //! nothing from the original fp32 file, the host can free that file once the int8
 //! buffers and the gains are in hand.
 
-use crate::error::EngineError;
-use crate::llama::config::Config;
-use crate::llama::weights::Weights;
-use crate::quant::{quantize, QuantizedTensor};
+use engine::error::EngineError;
+use crate::config::Config;
+use crate::weights::Weights;
+use engine::quant::{quantize, QuantizedTensor};
 
 /// Lengths (in weights) of the always-quantized tensors, in storage order: the
 /// `token_embedding` table first (it doubles as `wcls` when weights are shared), then
@@ -305,7 +305,7 @@ mod tests {
 
     fn quantized(c: &Config, gs: usize) -> (Vec<i8>, Vec<f32>) {
         // Distinct per-element values so the embedding and a separate wcls differ.
-        let wbuf: Vec<f32> = (0..crate::llama::weights::weight_floats(c))
+        let wbuf: Vec<f32> = (0..crate::weights::weight_floats(c))
             .map(|i| (i as f32).sin() * 0.1)
             .collect();
         let fp32 = Weights::new(&wbuf, c).unwrap();

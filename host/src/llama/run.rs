@@ -1,8 +1,8 @@
 //! The Llama-path entry point: dispatch a llama2.c checkpoint to conversion,
 //! generation, or report mode based on the parsed arguments.
 
-use engine::llama::quantize::{quantize_weights, quantized_scale_count, quantized_weight_count};
-use engine::llama::{ModelFormat, ModelWeights, QuantizedWeights};
+use llama::quantize::{quantize_weights, quantized_scale_count, quantized_weight_count};
+use llama::{ModelFormat, ModelWeights, QuantizedWeights};
 use engine::Sampler;
 
 use crate::args::Args;

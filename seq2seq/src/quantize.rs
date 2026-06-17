@@ -1,7 +1,7 @@
 //! Int8 quantization of the seq2seq (Marian / OPUS-MT) weight set.
 //!
-//! The encoder-decoder counterpart of [`crate::llama::quantize`], built on the same
-//! shared [`crate::quant`] primitives ([`QuantizedTensor`], [`quantize`]). It splits a
+//! The encoder-decoder counterpart of `llama::quantize`, built on the same
+//! shared [`engine::quant`] primitives ([`QuantizedTensor`], [`quantize`]). It splits a
 //! Marian checkpoint's tensors into two groups:
 //!
 //! * **Quantized** — the 17 matmul-heavy matrices, the ones whose `W · x` dominates the
@@ -27,10 +27,10 @@
 //! because neither borrows the original fp32 file the host can free it once the int8 data,
 //! the scales, and the kept buffer are in hand — the whole point of quantizing at load.
 
-use crate::error::EngineError;
-use crate::quant::{quantize, QuantizedTensor};
-use crate::seq2seq::config::Config;
-use crate::seq2seq::weights::Weights;
+use engine::error::EngineError;
+use engine::quant::{quantize, QuantizedTensor};
+use crate::config::Config;
+use crate::weights::Weights;
 
 /// Lengths (in weights) of the 17 always-quantized matmul tensors, in storage order:
 /// the shared `token_embedding`, the encoder's six projections, then the decoder's ten
@@ -93,7 +93,7 @@ pub fn kept_floats(c: &Config) -> usize {
 
 /// The largest matmul input dimension `d_in` across the quantized projections — the size
 /// each buffer of the W8A8 activation scratch
-/// ([`QuantScratch`](crate::QuantScratch)) must cover.
+/// ([`QuantScratch`](engine::QuantScratch)) must cover.
 ///
 /// Attention and `fc1` projections take `d_model`; `fc2` takes the (wider) ffn dimension,
 /// so the maximum is `max(d_model, enc_ffn, dec_ffn)`.
@@ -386,7 +386,7 @@ impl<'a> KeptWeights<'a> {
     ///
     /// Copies the 27 slice references out of `w`; the result borrows the same underlying
     /// file (`'a`), not `w` itself, so the caller can move `w` into a
-    /// [`ModelWeights`](crate::seq2seq::ModelWeights) afterward.
+    /// [`ModelWeights`](crate::ModelWeights) afterward.
     pub fn from_weights(w: &Weights<'a>) -> KeptWeights<'a> {
         let t = kept_tensors(w);
         KeptWeights {
@@ -476,8 +476,8 @@ impl<'a> KeptWeights<'a> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::seq2seq::config::Activation;
-    use crate::seq2seq::weights::weight_floats;
+    use crate::config::Activation;
+    use crate::weights::weight_floats;
 
     extern crate std;
     use std::vec;

@@ -1,0 +1,18 @@
+# Python dependencies for tiny-infer's offline, host-side scripts (scripts/).
+#
+# The Rust engine and CLI need NONE of this at runtime — these packages are only for
+# exporting a Hugging Face seq2seq model into tiny-infer's format and capturing the
+# Hugging Face parity references the engine's seq2seq tests check against. The Llama
+# path needs no Python at all. Install into a venv:
+#
+#   python -m venv venv && source venv/bin/activate
+#   pip install -r scripts/requirements.txt
+#
+# Unpinned on purpose (the Marian tensor/tokenizer names are stable across recent
+# releases; developed against transformers 4.x–5.x, torch 2.x). Pin if you need
+# byte-reproducible fixtures.
+
+torch           # export_marian.py, dump_encoder_ref.py, dump_decode_ref.py — load HF models, run encode/greedy-decode
+transformers    # Marian / OPUS-MT model + tokenizer classes (MarianMTModel, MarianTokenizer, AutoTokenizer)
+sentencepiece   # dump_tokenizer.py — read source.spm to build the host's tokenizer.bin
+numpy           # serialize tensors to little-endian f32 via torch's .numpy() bridge

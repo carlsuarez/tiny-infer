@@ -9,18 +9,18 @@
 //! key and value vectors straight into the cache row for the current
 //! `(layer, position)`, exactly as the reference does.
 //!
-//! [`Arena`]: crate::Arena
+//! [`Arena`]: engine::Arena
 
-use crate::arena::Arena;
-use crate::error::EngineError;
-use crate::llama::config::Config;
+use engine::arena::Arena;
+use engine::error::EngineError;
+use crate::config::Config;
 
 /// All mutable buffers a single forward pass reads and writes.
 ///
 /// Every field borrows a disjoint sub-slice of the arena block (`'buf`); because
 /// [`Arena::alloc`] hands back slices tied to the block's lifetime rather than to
 /// the arena borrow, they can all be held at once. Buffer sizes come straight from
-/// the [`Config`] and match [`crate::llama::memory`]'s budget.
+/// the [`Config`] and match [`crate::memory`]'s budget.
 #[derive(Debug)]
 pub struct RunState<'buf> {
     /// Residual stream, `[dim]`.
@@ -49,13 +49,13 @@ impl<'buf> RunState<'buf> {
     /// Carve every buffer out of `arena` for the given config.
     ///
     /// Allocates in a fixed order; the total is exactly
-    /// [`crate::llama::memory::arena_floats`]. Returns [`EngineError::ArenaOverflow`] if
+    /// [`crate::memory::arena_floats`]. Returns [`EngineError::ArenaOverflow`] if
     /// the arena was sized too small (size it with `arena_floats` to guarantee a
     /// fit).
     /// Carve every buffer out of `arena` for the given config.
     ///
     /// This is the fp32 working set only; the int8 path's activation scratch lives in a
-    /// separate [`QuantScratch`](crate::QuantScratch) so an fp32 run neither allocates nor
+    /// separate [`QuantScratch`](engine::QuantScratch) so an fp32 run neither allocates nor
     /// budgets for it.
     pub fn new(arena: &mut Arena<'buf>, c: &Config) -> Result<RunState<'buf>, EngineError> {
         let att_dim = c.n_heads * c.head_size();
@@ -79,7 +79,7 @@ impl<'buf> RunState<'buf> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::llama::memory::arena_floats;
+    use crate::memory::arena_floats;
 
     extern crate std;
     use std::vec;
@@ -133,9 +133,9 @@ mod tests {
 
     #[test]
     fn quant_scratch_checks_buffer_lengths() {
-        use crate::quant::QuantScratch;
+        use engine::quant::QuantScratch;
         let c = tiny_config();
-        let need = crate::llama::memory::max_proj_d_in(&c);
+        let need = crate::memory::max_proj_d_in(&c);
         let (mut xq, mut sc, mut gs) = (vec![0i8; need], vec![0.0f32; need], vec![0.0f32; need]);
         assert!(QuantScratch::new(&mut xq, &mut sc, &mut gs, need).is_ok());
 

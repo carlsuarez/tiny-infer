@@ -90,7 +90,7 @@ const SDOT_LANES: usize = 16;
 /// in the checkpoint uses, so no transpose is ever needed.
 ///
 /// This is the readable reference implementation; [`matmul_simd`] computes the same
-/// product with [`wide`] SIMD and is selected on the hot path via [`crate::llama::Kernel`].
+/// product with [`wide`] SIMD and is selected on the hot path via [`Kernel`].
 ///
 /// # Panics
 /// In debug builds, if the slice lengths disagree with `d_in`/`d_out`.
@@ -274,7 +274,7 @@ pub fn matmul_q8_simd(
 ///
 /// # Safety
 /// The CPU must support `avx2`, `avx512vl`, and `avx512vnni`. The std host verifies this
-/// with `is_x86_feature_detected!` before selecting [`Kernel::Dotprod`](crate::llama::Kernel);
+/// with `is_x86_feature_detected!` before selecting [`Kernel::Dotprod`](crate::Kernel);
 /// any other caller must guarantee it.
 ///
 /// # Panics
@@ -355,7 +355,7 @@ pub unsafe fn matmul_q8_dotprod(
 /// # Safety
 /// The CPU must support the NEON `dotprod` feature. The std host verifies this with
 /// `is_aarch64_feature_detected!("dotprod")` before selecting
-/// [`Kernel::Dotprod`](crate::llama::Kernel); any other caller must guarantee it.
+/// [`Kernel::Dotprod`](crate::Kernel); any other caller must guarantee it.
 ///
 /// # Panics
 /// In debug builds, if the slice lengths disagree with `d_in`/`d_out`/`group_size`.

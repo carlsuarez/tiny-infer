@@ -8,7 +8,7 @@
 //! reshaped: every field borrows straight out of the host's file buffer.
 //!
 //! Matrices are row-major `[d_out, d_in]`, matching both the engine's
-//! [`matmul`](crate::math::matmul) convention and PyTorch `nn.Linear` storage,
+//! [`matmul`](engine::math::matmul) convention and PyTorch `nn.Linear` storage,
 //! so the export script dumps Hugging Face tensors unmodified. Sinusoidal
 //! position embeddings are **not stored** — they are a pure function of
 //! `(pos, d_model)` and are computed at run time, exactly as the Llama path
@@ -38,8 +38,8 @@
 //! [`norm_before`](Config::norm_before) flag's business, not the file
 //! layout's; the storage order above is fixed either way.)
 
-use crate::error::EngineError;
-use crate::seq2seq::config::{Config, SEQ2SEQ_HEADER_BYTES};
+use engine::error::EngineError;
+use crate::config::{Config, SEQ2SEQ_HEADER_BYTES};
 
 /// Number of `f32` elements a seq2seq checkpoint stores after its header.
 pub const fn weight_floats(c: &Config) -> usize {
@@ -256,7 +256,7 @@ impl<'a> Weights<'a> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::seq2seq::config::Activation;
+    use crate::config::Activation;
 
     fn tiny_config() -> Config {
         Config {

@@ -115,7 +115,7 @@ fn run() -> Result<(), HostError> {
     // Route by architecture, sniffing each format from the checkpoint's leading bytes.
     // Order matters: the magic-bearing formats are tested first, because the llama
     // *legacy* format has no magic and `is_llama_file` is a structural fallback that a
-    // foreign header could otherwise match (see `engine::llama::config::is_llama`). To
+    // foreign header could otherwise match (see `llama::config::is_llama`). To
     // add a new architecture, give it its own magic and slot its check above llama's.
     if seq2seq::is_seq2seq_file(&model_path)? {
         seq2seq::run(&model_path, &args)

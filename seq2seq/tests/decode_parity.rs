@@ -13,9 +13,9 @@
 
 use std::path::PathBuf;
 
-use engine::seq2seq::config::SEQ2SEQ_HEADER_BYTES;
-use engine::seq2seq::memory::seq2seq_arena_floats;
-use engine::seq2seq::{greedy_decode, Config, KeptWeights, ModelWeights, RunState, Weights};
+use seq2seq::config::SEQ2SEQ_HEADER_BYTES;
+use seq2seq::memory::seq2seq_arena_floats;
+use seq2seq::{greedy_decode, Config, KeptWeights, ModelWeights, RunState, Weights};
 use engine::{Arena, Kernel};
 
 fn as_f32(bytes: &[u8]) -> Vec<f32> {

@@ -1,9 +1,9 @@
 //! Report mode for the Llama path: print the model config, tokenizer metadata, and
 //! the pre-computed memory budget.
 
-use engine::llama::memory::MemoryBudget;
-use engine::llama::quantize::{quantized_scale_count, quantized_weight_count};
-use engine::llama::{Config, ModelFormat};
+use llama::memory::MemoryBudget;
+use llama::quantize::{quantized_scale_count, quantized_weight_count};
+use llama::{Config, ModelFormat};
 use humansize::{format_size, BINARY};
 use thousands::Separable;
 

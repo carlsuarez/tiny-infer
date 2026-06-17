@@ -4,8 +4,8 @@
 use std::io::{self, Write};
 use std::time::Instant;
 
-use engine::llama::memory::{arena_floats, max_proj_d_in};
-use engine::llama::{forward, Config, Kernel, ModelWeights, QuantScratch, RunState};
+use llama::memory::{arena_floats, max_proj_d_in};
+use llama::{forward, Config, Kernel, ModelWeights, QuantScratch, RunState};
 use engine::sample::ProbIndex;
 use engine::{Arena, Sampler};
 

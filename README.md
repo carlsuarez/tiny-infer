@@ -10,6 +10,24 @@ Binary file formats mirror [Andrej Karpathy's llama2.c](https://github.com/karpa
 so exported checkpoints load unchanged. The correctness goal is token-for-token
 parity with llama2.c at temperature 0.
 
+## Commands at a glance
+
+`tiny-infer …` below is shorthand for `cargo run --release -p host -- …` (or the built
+binary `target/release/tiny-infer`). Full details in [Commands](#commands).
+
+| Task | Command |
+|------|---------|
+| Build everything (release) | `cargo build --release` |
+| Generate text (Llama) | `tiny-infer models/stories15M.bin models/tokenizer.bin -p "Once upon a time"` |
+| Sample (temperature + top-p) | `tiny-infer … -p "…" --temperature 1.0 --topp 0.9 --seed 42` |
+| Run weights as int8 | `tiny-infer … --quantize --group-size 32` (add `--dotprod` for the hardware int8 kernel) |
+| Convert a checkpoint | `tiny-infer models/stories15M.bin --convert out.v2.bin --to v2` |
+| Inspect a checkpoint (report) | `tiny-infer models/stories15M.bin models/tokenizer.bin` (no `--prompt`) |
+| Translate (seq2seq / Marian) | `tiny-infer models/opus-mt-en-fr/model.bin -p "Hello, world!"` |
+| Export a seq2seq model | `python scripts/export_marian.py Helsinki-NLP/opus-mt-en-fr -o models/opus-mt-en-fr` |
+| Run tests + lints | `cargo test` · `cargo clippy --all-targets` |
+| Prove the engine is `no_std` | `cargo build -p engine --target thumbv7em-none-eabi` |
+
 ## Status
 
 **Milestone 1 — parse & report (done).** Loads a checkpoint and tokenizer,
@@ -60,13 +78,13 @@ world!"` prints `Bonjour, le monde !`. The pieces:
   `--topp` / `--seed` apply here too. For seq2seq, greedy (the default) — or beam
   search — is the quality path; sampling adds diversity, not accuracy.
 
-The whole architecture stays self-contained — it never touches the Llama path — so it
-is always compiled in without disturbing the llama2.c parity gate.
+The whole architecture is its own crate (`seq2seq`) — it never touches the Llama path, so
+it can't disturb the llama2.c parity gate.
 
 **Int8 quantization (`--quantize`).** All the matmul weights — the seven layer
 projections and the token-embedding/classifier table — can be quantized to group-wise
 symmetric int8; only the (tiny) RMSNorm gains stay fp32. A single `forward` runs over
-either representation via an `engine::ModelWeights` enum. The embedding table is stored
+either representation via a `llama::ModelWeights` enum. The embedding table is stored
 **once** as int8 and the lookup dequantizes just the one row it needs, so it doubles as
 the `wcls` classifier under weight tying. On stories15M the int8 greedy output is
 identical to fp32.
@@ -154,50 +172,89 @@ Operations driven by file input (header parsing, weight carving, arena sizing) a
 fallible and return an `EngineError` rather than panicking, so a malformed checkpoint
 can never crash a caller; the memory budget is a `const fn` of the config, so a host can
 size a `static` arena at compile time. Beyond the build-only library check, a freestanding
-firmware example (`engine/examples/baremetal.rs`) supplies its own `#[panic_handler]` and
-runs a full forward pass out of stack buffers with no allocator — see [Test](#test).
+firmware example (`llama/examples/baremetal.rs`) supplies its own `#[panic_handler]` and
+runs a full forward pass out of stack buffers with no allocator — see
+[Bare-metal / `no_std` builds](#bare-metal--no_std-builds-the-embedded-target).
 
-## Workspace layout
+## Repository map
+
+Four crates in a Cargo workspace, plus Python helpers and git-ignored model fixtures.
+**`engine` is the reusable core; each model architecture is its own crate that depends on
+it** (the way a downstream project like edge-pm's `pmcore` would). The two architectures
+never reference each other.
 
 | crate / dir | role |
 |-------------|------|
-| `engine/`   | `#![no_std]`, allocation-free inference core. Depends only on `core` + two `no_std` crates: `libm` (transcendentals) and `rand` (sampler PRNG, no default features). |
-| `host/`     | `std` CLI binary `tiny-infer`: file loading, tokenizers, generation (Llama + seq2seq), argument handling, reporting. Split into `llama/` and `seq2seq/` modules mirroring the engine. |
-| `host/tests/` | end-to-end CLI tests (metadata + parity assertions run against the real fixtures when present). |
-| `scripts/`  | `export_marian.py` converts a Hugging Face `MarianMTModel` (OPUS-MT) to tiny-infer's seq2seq format; `dump_tokenizer.py` builds the tokenizer artifact; `dump_*_ref.py` capture Hugging Face parity references. |
-| `models/`   | downloaded checkpoints (git-ignored). |
+| `engine/`   | `#![no_std]`, allocation-free **shared core** — arena, error, math/quant kernels, the 1-D CNN ops, and the sampler. No model shapes. Depends only on `core` + `libm`, `rand`, `wide` (all `no_std`). |
+| `llama/`    | `#![no_std]` **Llama-2** model crate (decoder-only, llama2.c-compatible). Depends on `engine`. Holds the baremetal example. |
+| `seq2seq/`  | `#![no_std]` **Marian / OPUS-MT** encoder-decoder model crate. Depends on `engine`. Holds the encoder/decoder parity gates. |
+| `host/`     | `std` CLI binary `tiny-infer`: file loading, tokenizers, generation, reporting. Depends on `engine` + `llama` + `seq2seq`; `llama/` and `seq2seq/` driver modules mirror the model crates. |
+| `scripts/`  | Python: export a Hugging Face seq2seq model + build its tokenizer, and capture parity references (see [Python scripts](#python-scripts)). |
+| `models/`   | downloaded / exported checkpoints + parity fixtures (**git-ignored**; recreate via curl + the scripts). |
 
-### Inside the engine: a shared core plus two architectures
+### The engine — the shared core
 
-The engine's module tree makes the architecture split explicit. A small **shared
-core** holds the building blocks that don't depend on any one model shape, and two
-**parallel, self-contained architecture modules** sit on top of it — they never
-reference each other, meeting only at the shared core.
+The building blocks that don't depend on any one model shape. Nothing here knows about
+Llama or Marian; the model crates build entirely on top of it.
 
 ```
 engine/src/
-  lib.rs           # crate root; re-exports the shared core (Arena, EngineError, QuantizedTensor, QuantScratch, Kernel, Sampler)
-  arena.rs         # shared: the bump Arena every working buffer is carved from
-  error.rs         # shared: the crate-wide EngineError
-  math.rs          # shared: fp32 + int8 compute kernels (matmul, W8A8, norms, attention, RoPE, …)
-  quant.rs         # shared: group-wise int8 quantization primitives (QuantizedTensor, QuantScratch, quantize/dequantize)
-  sample.rs        # shared: the Sampler (greedy / temperature / top-p) over rand's no_std Xoshiro128++ PRNG
-  llama/           # decoder-only Llama-2 (llama2.c-compatible): RMSNorm, RoPE, SwiGLU, causal GQA
-    config.rs weights.rs memory.rs state.rs model.rs quantize.rs
-  seq2seq/         # encoder-decoder Marian / OPUS-MT: LayerNorm+bias, sinusoidal positions, cross-attention
-    config.rs weights.rs memory.rs state.rs model.rs quantize.rs
+  lib.rs           # crate root; re-exports Arena, EngineError, QuantizedTensor, QuantScratch, Kernel, Sampler
+  arena.rs         # the bump Arena every working buffer is carved from
+  error.rs         # the crate-wide EngineError
+  math.rs          # fp32 + int8 compute kernels (matmul, W8A8, norms, attention, RoPE, …)
+  nn.rs            # 1-D CNN kernels (conv1d, relu, global_avg_pool) for feature-window classifiers
+  quant.rs         # group-wise int8 quantization primitives (QuantizedTensor, QuantScratch, quantize/dequantize)
+  sample.rs        # the Sampler (greedy / temperature / top-p) over rand's no_std Xoshiro128++ PRNG
 ```
 
-Each architecture's public types are reached through its module path —
-`engine::llama::{Config, Weights, forward, …}` and `engine::seq2seq::{Config, Weights,
-encode, greedy_decode, …}` — so the two never collide and the directory layout *is*
-the API surface. Both the `llama/` and `seq2seq/` paths are always compiled in, stay
-fully independent of each other, and are `#![no_std]`, allocation-free, and arena-backed.
+### The model crates — `llama` and `seq2seq`
 
-The host mirrors that split: `host/src/{llama,seq2seq}/` each own their loader,
-tokenizer, driver (`generate`), and report code, over a small shared base
-(`error`, `args`), with `main.rs` a thin dispatcher that routes a checkpoint to
-the right module by its magic.
+Two parallel, self-contained `no_std` crates, each consuming `engine`. Their files play
+the same roles, so once you know one you know the other:
+
+```
+llama/src/         seq2seq/src/      # role of each file
+  config.rs          config.rs       #   header parse, format detection, derived dims
+  weights.rs         weights.rs      #   zero-copy fp32 tensor views
+  memory.rs          memory.rs       #   const fn arena budget (activations + KV cache)
+  state.rs           state.rs        #   RunState — the working set carved once from the arena
+  model.rs           model.rs        #   the allocation-free forward / encode / greedy_decode
+  quantize.rs        quantize.rs     #   int8 weight layout (on engine::quant primitives)
+  lib.rs             lib.rs          #   crate root; re-exports the public types
+llama/examples/baremetal.rs          # freestanding #![no_std]/#![no_main] firmware proof
+seq2seq/tests/{encode,decode}_parity.rs   # gates vs Hugging Face (fixtures from scripts/dump_*_ref.py)
+```
+
+Each crate names its config `Config`, its weights `Weights`, and its working set
+`RunState`; the crate path keeps them distinct — `llama::{Config, Weights, forward, …}`
+and `seq2seq::{Config, Weights, encode, greedy_decode, …}`.
+
+### The host — the same split behind the CLI
+
+```
+host/src/
+  main.rs          # thin dispatcher: routes a checkpoint to llama/ or seq2seq/ by its magic
+  args.rs          # the hand-rolled flag parser (every --flag the CLI accepts)
+  error.rs         # host error type wrapping engine + io errors into clean messages
+  llama/           # loader.rs (legacy/v1/v2 + tokenizer.bin), tokenizer.rs (BPE), generate.rs (decode loop),
+                   #   run.rs (orchestration), report.rs (inspect mode), convert.rs (--convert v1/v2)
+  seq2seq/         # loader.rs, tokenizer.rs (SentencePiece Unigram/Viterbi), generate.rs, run.rs, report.rs
+```
+
+### Tests
+
+| file | gate |
+|------|------|
+| `host/tests/cli.rs` | CLI arg handling (always) + stories15M metadata (when fixtures present) |
+| `host/tests/generate.rs` | greedy output pinned to a golden string; sampling reproducible under `--seed` |
+| `host/tests/formats.rs` | converted v1/v2 checkpoints generate exactly what the legacy file does |
+| `host/tests/seq2seq.rs` | seq2seq loader/report on a synthetic checkpoint + real OPUS-MT when exported |
+| `seq2seq/tests/encode_parity.rs` | `seq2seq::encode` == HF `last_hidden_state` (fixture from `dump_encoder_ref.py`) |
+| `seq2seq/tests/decode_parity.rs` | `seq2seq::greedy_decode` == HF greedy stream (fixture from `dump_decode_ref.py`) |
+
+Every fixture-dependent test **skips itself on a clean checkout** and runs the real
+comparison once the model/fixture is present, so `cargo test` is green either way.
 
 The engine works in units of `f32` — the element type of every activation and
 KV-cache buffer — so the arena hands out disjoint `&mut [f32]` slices with no
@@ -206,7 +263,43 @@ KV-cache buffer — so the arena hands out disjoint `&mut [f32]` slices with no
 cast, so neither crate carries any `unsafe` of its own — except the engine's one
 cfg-gated x86 block for the AVX-512 VNNI int8 kernel.
 
-## Getting the model
+## Python scripts
+
+The Rust engine and CLI need **no Python at runtime**. The scripts in `scripts/` are
+host-side, offline helpers used only to (a) export a Hugging Face seq2seq model into
+tiny-infer's format and (b) capture Hugging Face reference outputs for the engine's
+seq2seq parity gates. The Llama path needs none of them — its checkpoint and tokenizer
+are downloaded directly (see [Getting the models](#getting-the-models)).
+
+They run in a venv:
+
+```sh
+python -m venv venv && source venv/bin/activate
+pip install -r scripts/requirements.txt      # torch, transformers, sentencepiece, numpy
+```
+
+| script | what it does | writes (under `models/<dir>/`) | needs | used by |
+|--------|--------------|-------------------------------|-------|---------|
+| **export_marian.py** | Converts a Hugging Face `MarianMTModel` (OPUS-MT) to tiny-infer's `tis2` seq2seq format, and saves the SentencePiece artifacts; calls `dump_tokenizer.py` for you. | `model.bin`, `source.spm`/`target.spm`/`vocab.json`, `tokenizer.bin` | torch, transformers, sentencepiece | the seq2seq CLI; `tests/seq2seq.rs` |
+| **dump_tokenizer.py** | Builds the host's `tokenizer.bin` (Unigram piece/score table + id→piece map) from `source.spm` + `vocab.json`. Usually run automatically by `export_marian.py`; run it standalone to rebuild just the tokenizer. | `tokenizer.bin` | sentencepiece (no torch) | the seq2seq tokenizer |
+| **dump_encoder_ref.py** | Runs HF's Marian **encoder** on a fixed input and dumps its `last_hidden_state`. | `encoder_ref.bin` | torch, transformers | `engine/tests/encode_parity.rs` |
+| **dump_decode_ref.py** | Runs HF **greedy generation** (`num_beams=1, do_sample=False`) on a fixed sentence and dumps the source + generated token ids. | `decode_ref.bin` | torch, transformers | `engine/tests/decode_parity.rs` |
+
+Typical flow — export a translation model, then (optionally) generate the parity
+fixtures so the engine's seq2seq gates run instead of skipping:
+
+```sh
+python scripts/export_marian.py Helsinki-NLP/opus-mt-en-fr -o models/opus-mt-en-fr
+HF_HUB_OFFLINE=1 python scripts/dump_encoder_ref.py    # writes encoder_ref.bin  (after the hub cache is warm)
+HF_HUB_OFFLINE=1 python scripts/dump_decode_ref.py     # writes decode_ref.bin
+```
+
+The on-disk binary layouts are documented in each script's header and kept in lockstep
+with the matching Rust module (`seq2seq/src/` and `host/src/seq2seq/tokenizer.rs`).
+
+## Getting the models
+
+The **Llama** path downloads its checkpoint and tokenizer directly (no scripts):
 
 ```sh
 mkdir -p models
@@ -216,10 +309,16 @@ curl -L -o models/tokenizer.bin \
   https://raw.githubusercontent.com/karpathy/llama2.c/master/tokenizer.bin
 ```
 
-## Build & run
+The **seq2seq** path is produced by `scripts/export_marian.py` (see
+[Python scripts](#python-scripts)).
+
+## Commands
+
+These run the `host` CLI — tiny-infer's "simulator": it loads a checkpoint and runs the
+engine on the CPU. `tiny-infer …` is shorthand for `cargo run --release -p host -- …`.
 
 ```sh
-cargo build --release
+cargo build --release      # build the engine + host CLI (release; needed for real throughput)
 ```
 
 **Generate text:**
@@ -284,7 +383,7 @@ en→fr translation model, but the same path serves any seq2seq task the model w
 trained for:
 
 ```sh
-pip install torch transformers sentencepiece
+pip install -r scripts/requirements.txt      # see Python scripts
 python scripts/export_marian.py Helsinki-NLP/opus-mt-en-fr -o models/opus-mt-en-fr
 cargo run --release -p host -- models/opus-mt-en-fr/model.bin --prompt "Hello, world!"
 # -> Bonjour, le monde !
@@ -349,31 +448,37 @@ tiny-infer stories15M.bin tokenizer.bin -p "Tom went to the park" -n 40
 Both print identical text. The golden output is also pinned in
 `host/tests/generate.rs`.
 
-## Test
+## Tests & checks
 
 ```sh
 cargo test            # unit tests (engine + host) and CLI/generation integration tests
 cargo clippy --all-targets
 ```
 
-The `engine` crate is genuinely `no_std`; verify by building it for a bare-metal
-target with no `std` available:
+`cargo test` is green on a clean checkout: the fixture-dependent gates skip themselves
+until the models/fixtures exist (see [Tests](#tests) for the full matrix and which
+script produces each fixture).
+
+### Bare-metal / `no_std` builds (the embedded target)
+
+The `engine` core and both model crates (`llama`, `seq2seq`) are genuinely `no_std`;
+verify by building them for a bare-metal target with no `std` available:
 
 ```sh
-cargo build -p engine --target thumbv7em-none-eabi
+cargo build -p engine -p llama -p seq2seq --target thumbv7em-none-eabi
 ```
 
-That builds the library, which borrows the host's panic handler and allocator. To
-prove the engine stands on its own, the `baremetal` example is a freestanding
-`#![no_std]` / `#![no_main]` firmware binary that supplies its own `#[panic_handler]`
-and runs a full forward pass entirely out of stack buffers — no heap, no allocator, no
-`std`:
+That builds the libraries, which borrow the host's panic handler and allocator. To
+prove they stand on their own, the `baremetal` example (in the `llama` crate) is a
+freestanding `#![no_std]` / `#![no_main]` firmware binary that supplies its own
+`#[panic_handler]` and runs a full forward pass entirely out of stack buffers — no
+heap, no allocator, no `std`:
 
 ```sh
-cargo build -p engine --example baremetal --target thumbv7em-none-eabi
+cargo build -p llama --example baremetal --target thumbv7em-none-eabi
 ```
 
 (The same file builds as an ordinary example on a hosted target, where its `main` just
 points you at the command above. Because every transcendental routes through `libm`
 rather than `std`'s `f32` methods, the bare-metal build also fails fast if a `std`-only
-float intrinsic ever slips into the engine.)
+float intrinsic ever slips in.)

@@ -1,8 +1,8 @@
 //! Report mode for the seq2seq path: print the Marian config and the four-group
 //! memory budget.
 
-use engine::seq2seq::quantize::{kept_floats, quantized_scale_count, quantized_weight_count};
-use engine::seq2seq::{Activation, Config, MemoryBudget};
+use seq2seq::quantize::{kept_floats, quantized_scale_count, quantized_weight_count};
+use seq2seq::{Activation, Config, MemoryBudget};
 use humansize::{format_size, BINARY};
 use thousands::Separable;
 

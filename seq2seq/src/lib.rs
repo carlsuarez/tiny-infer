@@ -1,15 +1,14 @@
-//! Encoder-decoder (seq2seq) architecture support: Marian / OPUS-MT models,
-//! alongside the decoder-only Llama path.
+//! Encoder-decoder (seq2seq) architecture: Marian / OPUS-MT models.
 //!
-//! The encoder-decoder shape underlies any sequence-to-sequence task — translation,
-//! summarization, paraphrasing, grammar correction — that maps an input sequence to a
-//! freshly generated output sequence; the OPUS-MT checkpoints used as fixtures happen
-//! to be translation models, but nothing here is specific to translation.
+//! A standalone `no_std`, allocation-free crate that builds the encoder-decoder
+//! transformer on top of the shared [`engine`] core — parallel to the sibling `llama`
+//! crate but sharing no code with it. The encoder-decoder shape underlies any
+//! sequence-to-sequence task — translation, summarization, paraphrasing, grammar
+//! correction; the OPUS-MT checkpoints used as fixtures happen to be translation
+//! models, but nothing here is specific to translation.
 //!
-//! This module is the second architecture the engine ships. It is deliberately
-//! **parallel** to the decoder-only path — nothing here touches [`Config`],
-//! [`forward`], or the RoPE/RMSNorm kernels, whose llama2.c parity gate must stay
-//! bit-identical — so it stays fully self-contained even though it is always compiled in.
+//! It is deliberately independent of the decoder-only `llama` path — it touches none of
+//! that crate's `Config`, `forward`, or RoPE/RMSNorm kernels — so the two never collide.
 //!
 //! A Marian model differs from Llama in shape, not just weights: a bidirectional
 //! encoder stack feeds a decoder stack through cross-attention, normalization is
@@ -31,13 +30,14 @@
 //!   int8 weights via [`ModelWeights`].
 //! * [`quantize`] — int8 quantization of the Marian weight set ([`QuantizedWeights`] for
 //!   the 17 matmul matrices, [`KeptWeights`] for the fp32 biases / LayerNorms), layered
-//!   on the shared [`quant`](crate::quant) primitives.
+//!   on the shared [`quant`](engine::quant) primitives.
 //!
 //! Like the Llama path, the forward passes are allocation-free and carve their
-//! working set once from the caller's [`Arena`](crate::Arena).
-//!
-//! [`Config`]: crate::llama::Config
-//! [`forward`]: crate::llama::forward
+//! working set once from the caller's [`Arena`](engine::Arena).
+
+#![no_std]
+#![forbid(unsafe_op_in_unsafe_fn)]
+#![warn(missing_docs)]
 
 pub mod config;
 pub mod memory;

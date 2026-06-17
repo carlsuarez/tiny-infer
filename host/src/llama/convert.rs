@@ -18,8 +18,8 @@ use std::fs::File;
 use std::io::{self, BufWriter, Write};
 use std::path::Path;
 
-use engine::llama::config::{MAGIC, VERSIONED_HEADER_BYTES};
-use engine::llama::{Config, ModelFormat, Weights};
+use llama::config::{MAGIC, VERSIONED_HEADER_BYTES};
+use llama::{Config, ModelFormat, Weights};
 use engine::quant::quantize;
 
 use crate::error::HostError;
@@ -135,7 +135,7 @@ fn write_v1(out: &mut impl Write, w: &Weights, c: &Config) -> io::Result<()> {
 
 /// Serialize the model as a v2 checkpoint: header, fp32 norms, then each matmul
 /// tensor quantized to int8 — data immediately followed by its scales, one tensor
-/// per layer, in `runq.c`'s order (the order [`engine::llama::quantize::v2_tensor_sizes`]
+/// per layer, in `runq.c`'s order (the order [`llama::quantize::v2_tensor_sizes`]
 /// describes).
 fn write_v2(out: &mut impl Write, w: &Weights, c: &Config, group_size: usize) -> io::Result<()> {
     out.write_all(&header(c, 2, Some(group_size as i32)))?;

@@ -39,9 +39,9 @@ fn main() {
 mod firmware {
     use core::panic::PanicInfo;
 
-    use engine::llama::memory::{arena_floats, MemoryBudget};
-    use engine::llama::weights::weight_floats;
-    use engine::llama::{forward, Config, Kernel, ModelWeights, RunState, Weights};
+    use llama::memory::{arena_floats, MemoryBudget};
+    use llama::weights::weight_floats;
+    use llama::{forward, Config, Kernel, ModelWeights, RunState, Weights};
     use engine::{math, Arena};
 
     /// A tiny synthetic model. Small enough that every buffer fits comfortably on the
@@ -101,7 +101,7 @@ mod firmware {
         // One decoder step for token 1 at position 0, scalar fp32 kernels, fp32 weights
         // (so no int8 activation scratch is needed — pass `None`).
         let logits = forward(&CFG, &weights, &mut state, 1, 0, Kernel::Scalar, &mut None);
-        let next = math::argmax(logits);
+        let (next, _confidence) = math::argmax(logits);
 
         // SAFETY: a plain volatile store to our own static; no aliasing, no concurrency.
         unsafe { core::ptr::write_volatile(&raw mut SINK, next as u32) };

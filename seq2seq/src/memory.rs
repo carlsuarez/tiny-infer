@@ -2,7 +2,7 @@
 //!
 //! Computes, from a [`Config`] and the source/target lengths alone, how
 //! large the working arena must be — before any buffer is touched. This is the
-//! seq2seq counterpart of [`crate::llama::memory`], and the contract is the same: the
+//! seq2seq counterpart of `llama::memory`, and the contract is the same: the
 //! seq2seq run state carves exactly this budget from the caller's arena, once,
 //! and the forward passes then allocate nothing.
 //!
@@ -28,7 +28,7 @@
 //!   logits), shared between the encoder's per-position loops and the decoder
 //!   step.
 
-use crate::seq2seq::config::Config;
+use crate::config::Config;
 
 const F32: usize = core::mem::size_of::<f32>();
 
@@ -73,7 +73,7 @@ pub const fn seq2seq_step_floats(c: &Config, src_len: usize, tgt_len: usize) -> 
 ///
 /// `const`, so an embedded host can size a `static`/stack arena — and
 /// `const`-assert it fits a fixed RAM budget — at compile time, exactly like
-/// [`crate::llama::memory::arena_floats`] on the Llama path.
+/// `llama::memory::arena_floats` on the Llama path.
 pub const fn seq2seq_arena_floats(c: &Config, src_len: usize, tgt_len: usize) -> usize {
     seq2seq_encoder_floats(c, src_len)
         + seq2seq_cross_kv_floats(c, src_len)
@@ -145,7 +145,7 @@ impl MemoryBudget {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::seq2seq::config::Activation;
+    use crate::config::Activation;
 
     fn tiny_config() -> Config {
         Config {

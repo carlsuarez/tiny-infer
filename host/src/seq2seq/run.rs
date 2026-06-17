@@ -3,11 +3,11 @@
 
 use std::path::{Path, PathBuf};
 
-use engine::seq2seq::quantize::{
+use seq2seq::quantize::{
     kept_floats, pack_kept, quantize_weights, quantized_scale_count, quantized_weight_count,
     KeptWeights, QuantizedWeights,
 };
-use engine::seq2seq::{Config, ModelWeights};
+use seq2seq::{Config, ModelWeights};
 use engine::Sampler;
 
 use crate::args::Args;

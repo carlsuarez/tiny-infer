@@ -6,8 +6,8 @@
 //! in [`crate::math`] operate on a [`QuantizedTensor`], so these primitives live in
 //! the shared core rather than inside either architecture module. The Llama path's
 //! weight-set quantization (which tensors are quantized, the on-disk v2 format, the
-//! [`QuantizedWeights`](crate::llama::quantize::QuantizedWeights) bundle) builds on
-//! these in [`crate::llama::quantize`]; the seq2seq path will reuse them too.
+//! `QuantizedWeights` bundle) builds on
+//! these in `llama::quantize`; the seq2seq path will reuse them too.
 //!
 //! The scheme is *group-wise* and *symmetric*, matching llama2.c's `runq.c`
 //! (`GS` = group size): every run of `group_size` consecutive values shares one

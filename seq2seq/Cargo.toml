@@ -1,0 +1,21 @@
+[package]
+name = "seq2seq"
+description = "no_std encoder-decoder (Marian / OPUS-MT) inference, built on the tiny-infer engine"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[lib]
+name = "seq2seq"
+path = "src/lib.rs"
+
+[dependencies]
+# The shared inference core (Arena, math/quant kernels, sampler).
+engine = { path = "../engine" }
+# Transcendental fns `core` lacks (used directly by the forward passes).
+libm = "0.2.16"
+
+[dev-dependencies]
+# Only for the `rejects_wrong_magic` unit test, which checks a llama2.c header does
+# not parse as seq2seq — the two crates share no code in the actual build.
+llama = { path = "../llama" }

@@ -5,7 +5,7 @@
 //! [`encode`] runs the Marian encoder over a tokenized source sentence and leaves
 //! the `src_len × d_model` encoder output in [`RunState::enc_x`] — the
 //! `last_hidden_state` the decoder's cross-attention will read. It assembles the
-//! shared `no_std` building-block kernels from [`crate::math`] (LayerNorm, biased
+//! shared `no_std` building-block kernels from [`engine::math`] (LayerNorm, biased
 //! linears, GELU/swish, sinusoidal positions, the generalized attention helper)
 //! into Marian's post-norm layer, following Hugging Face `MarianEncoder`
 //! operation-for-operation so the output matches `encoder(...).last_hidden_state`.
@@ -22,12 +22,12 @@
 //! `scale_embedding` is set) and the sinusoidal positions are *added*, computed on
 //! the fly by [`math::sinusoidal_into`].
 
-use crate::math::{self, Kernel, KvHead};
-use crate::quant::{QuantScratch, QuantizedTensor};
-use crate::seq2seq::config::{Activation, Config};
-use crate::seq2seq::quantize::{KeptWeights, QuantizedWeights};
-use crate::seq2seq::state::RunState;
-use crate::seq2seq::weights::Weights;
+use engine::math::{self, Kernel, KvHead};
+use engine::quant::{QuantScratch, QuantizedTensor};
+use crate::config::{Activation, Config};
+use crate::quantize::{KeptWeights, QuantizedWeights};
+use crate::state::RunState;
+use crate::weights::Weights;
 
 /// Which matmul matrix a [`ModelWeights::matmul`] call should apply.
 ///
@@ -108,7 +108,7 @@ impl<'a> ModelWeights<'a> {
             }
             ModelWeights::Q8(w) => {
                 let row = w.token_embedding.layer(token, 1, d);
-                crate::quant::dequantize(out, &row);
+                engine::quant::dequantize(out, &row);
             }
         }
     }
@@ -712,10 +712,10 @@ pub fn greedy_decode(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::arena::Arena;
-    use crate::seq2seq::config::Activation;
-    use crate::seq2seq::memory::seq2seq_arena_floats;
-    use crate::seq2seq::weights::weight_floats;
+    use engine::arena::Arena;
+    use crate::config::Activation;
+    use crate::memory::seq2seq_arena_floats;
+    use crate::weights::weight_floats;
 
     extern crate std;
     use std::vec;
@@ -879,7 +879,7 @@ mod tests {
 
     /// Build the int8 buffers + views for the int8 (Q8) path from fp32 weights.
     fn quantize(c: &Config, wbuf: &[f32], gs: usize) -> (Vec<i8>, Vec<f32>, Vec<f32>) {
-        use crate::seq2seq::quantize::{
+        use crate::quantize::{
             kept_floats, pack_kept, quantize_weights, quantized_scale_count, quantized_weight_count,
         };
         let fp32 = Weights::new(wbuf, c).unwrap();
@@ -893,8 +893,8 @@ mod tests {
 
     #[test]
     fn q8_decode_tracks_fp32_and_kernels_agree() {
-        use crate::quant::QuantScratch;
-        use crate::seq2seq::quantize::max_proj_d_in;
+        use engine::quant::QuantScratch;
+        use crate::quantize::max_proj_d_in;
 
         let c = tiny_config(Activation::Swish);
         let wbuf = fake_weights(&c);
