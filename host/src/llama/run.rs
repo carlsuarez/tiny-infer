@@ -1,4 +1,4 @@
-//! The Llama-path entry point: dispatch a llama2.c checkpoint to conversion,
+//! The Llama-path entry point: dispatch a Llama-2 checkpoint to conversion,
 //! generation, or report mode based on the parsed arguments.
 
 use llama::quantize::{quantize_weights, quantized_scale_count, quantized_weight_count};
@@ -15,7 +15,7 @@ use crate::llama::loader::Model;
 use crate::llama::report::{report_memory, report_model, report_tokenizer};
 use crate::llama::tokenizer::Vocab;
 
-/// Run a llama2.c checkpoint: convert it, generate from it, or report on it.
+/// Run a Llama-2 checkpoint: convert it, generate from it, or report on it.
 pub fn run(model_path: &str, args: &Args) -> Result<(), HostError> {
     let model = Model::load(model_path)?;
     let config = model.config; // Copy, so generation can outlive the file buffer.

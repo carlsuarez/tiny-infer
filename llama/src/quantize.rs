@@ -81,7 +81,7 @@ pub fn quantized_scale_count(c: &Config, group_size: usize) -> usize {
 /// The sizes (in weights) of the quantized tensors as a **v2 checkpoint** stores
 /// them, in file order.
 ///
-/// A v2 file (llama2.c `runq.c`'s format) serializes each tensor as its int8 data
+/// A v2 file (the quantized int8 format) serializes each tensor as its int8 data
 /// immediately followed by its `f32` scales — and, unlike [`quantize_weights`]'
 /// two flat buffers, every *layer* of a projection is its own tensor. The order is
 /// the embedding, then for each projection all `n_layers` layer matrices

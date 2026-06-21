@@ -89,7 +89,7 @@ pub(crate) fn generate(
             sampler.sample(logits, &mut probindex) // generate the next token
         };
         pos += 1;
-        // BOS delimits sequences in llama2.c — stop if the model emits it.
+        // BOS delimits sequences in Llama-2 — stop if the model emits it.
         if next == BOS_ID {
             break;
         }

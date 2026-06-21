@@ -6,9 +6,9 @@
 //! output is pinned to a golden string; temperature sampling is checked for
 //! reproducibility under a fixed `--seed`.
 //!
-//! The golden text below is byte-for-byte identical to Karpathy's `run.c` greedy
-//! output on the same checkpoint and prompt (verified 2026-06-07 with
-//! `run stories15M.bin -z tokenizer.bin -t 0 -n 40 -i "Tom went to the park"`).
+//! The golden text below is byte-for-byte identical to the reference C
+//! implementation's greedy output on the same checkpoint and prompt (verified
+//! 2026-06-07 with `-z tokenizer.bin -t 0 -n 40 -i "Tom went to the park"`).
 //! So this both pins the reference parity and guards against regressions.
 
 use std::path::PathBuf;

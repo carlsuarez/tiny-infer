@@ -4,7 +4,7 @@
 //! — before any buffer is touched. This is what lets the host pre-allocate one
 //! block and lets the CLI report the budget up front.
 //!
-//! The layout mirrors llama2.c's `RunState`: a set of activation scratch buffers
+//! The layout is the usual decoder `RunState`: a set of activation scratch buffers
 //! plus the KV cache. The KV cache dominates and grows with `n_layers * seq_len`.
 
 use crate::config::Config;

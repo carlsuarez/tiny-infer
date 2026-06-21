@@ -4,12 +4,13 @@
 //! buffer (activations and KV cache) is carved from one caller-provided block of
 //! memory, and nothing in the forward pass allocates or grows.
 //!
-//! This arena works in units of `f32` — the element type of every buffer in the
-//! model — which lets it hand out `&mut [f32]` views using
+//! This arena works in units of a single element type `T` — the element type of
+//! the buffers it backs (`f32` activations on the float path, `i8` activations on a
+//! quantized one) — which lets it hand out `&mut [T]` views using
 //! [`slice::split_at_mut`], with **no `unsafe` and no aliasing**: each allocation
 //! is a disjoint sub-slice of the original block. The host supplies a properly
-//! aligned `&mut [f32]` (e.g. a `vec![0.0f32; n]`), sized via
-//! `llama::memory::arena_floats`.
+//! aligned `&mut [T]` (e.g. a `vec![0.0f32; n]`), sized via a model's `…_floats` /
+//! buffer-length helper. `T` defaults to `f32`, the common case.
 //!
 //! The intended lifecycle is *allocate-once*: a `RunState` carves all of its
 //! buffers from the arena during initialization and then reuses them in place for
@@ -18,24 +19,25 @@
 
 use crate::error::EngineError;
 
-/// A bump allocator over a borrowed block of `f32`.
+/// A bump allocator over a borrowed block of `T` (defaults to `f32`).
 ///
-/// Each [`alloc`](Arena::alloc) returns a fresh, disjoint `&mut [f32]` that lives
+/// Each [`alloc`](Arena::alloc) returns a fresh, disjoint `&mut [T]` that lives
 /// as long as the original block (`'buf`), so multiple buffers can be held at
-/// once. Tracks a high-water mark for peak-usage reporting.
+/// once. Tracks a high-water mark for peak-usage reporting. `T` is the activation
+/// element type — `f32` for a float forward pass, `i8` for an integer-only one.
 #[derive(Debug)]
-pub struct Arena<'buf> {
+pub struct Arena<'buf, T = f32> {
     /// The not-yet-handed-out tail of the block. Briefly swapped for an empty slice
     /// (via [`core::mem::take`]) while an allocation splits it, so it is never
     /// observably empty-by-accident — and the arena needs no panicking `unwrap`.
-    free: &'buf mut [f32],
+    free: &'buf mut [T],
     capacity: usize,
     used: usize,
 }
 
-impl<'buf> Arena<'buf> {
+impl<'buf, T: Copy + Default> Arena<'buf, T> {
     /// Wrap a pre-allocated block. The arena never grows beyond `buf`.
-    pub fn new(buf: &'buf mut [f32]) -> Self {
+    pub fn new(buf: &'buf mut [T]) -> Self {
         let capacity = buf.len();
         Arena {
             free: buf,
@@ -44,12 +46,11 @@ impl<'buf> Arena<'buf> {
         }
     }
 
-    /// Carve `n` contiguous `f32` from the arena, zeroed-as-stored (the host
-    /// hands us a zeroed block; values are whatever was last written).
+    /// Carve `n` contiguous `T` from the arena, zeroed (`T::default()`).
     ///
     /// Returns [`EngineError::ArenaOverflow`] if fewer than `n` elements remain;
     /// the arena is left unchanged on failure.
-    pub fn alloc(&mut self, n: usize) -> Result<&'buf mut [f32], EngineError> {
+    pub fn alloc(&mut self, n: usize) -> Result<&'buf mut [T], EngineError> {
         // Take ownership of the free tail (leaving an empty slice in its place) so we
         // can split it without aliasing. `mem::take` keeps this allocation-free *and*
         // panic-free — there is no fallible `unwrap`/`expect` anywhere in the arena.
@@ -58,18 +59,18 @@ impl<'buf> Arena<'buf> {
             let available = core::mem::size_of_val(free);
             self.free = free; // restore; allocation failed
             return Err(EngineError::ArenaOverflow {
-                requested: n * core::mem::size_of::<f32>(),
+                requested: n * core::mem::size_of::<T>(),
                 available,
             });
         }
         let (head, tail) = free.split_at_mut(n);
         self.free = tail;
         self.used += n;
-        head.fill(0.0);
+        head.fill(T::default());
         Ok(head)
     }
 
-    /// Total capacity in `f32` elements.
+    /// Total capacity in `T` elements.
     #[inline]
     pub fn capacity(&self) -> usize {
         self.capacity
@@ -90,7 +91,7 @@ impl<'buf> Arena<'buf> {
     /// Peak usage in bytes — for the CLI's memory report.
     #[inline]
     pub fn peak_bytes(&self) -> usize {
-        self.used * core::mem::size_of::<f32>()
+        self.used * core::mem::size_of::<T>()
     }
 }
 

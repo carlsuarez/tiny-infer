@@ -2,7 +2,7 @@
 //! SentencePiece-BPE tokenizer, format conversion, text generation, and reporting.
 //!
 //! The sibling of [`crate::seq2seq`]. [`run`] is the entry point `main` dispatches a
-//! llama2.c checkpoint to (report, generate, or convert); [`is_llama_file`] is how
+//! Llama-2 checkpoint to (report, generate, or convert); [`is_llama_file`] is how
 //! `main` recognizes one; the submodules hold the pieces it drives.
 
 pub mod convert;

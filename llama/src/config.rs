@@ -1,6 +1,6 @@
-//! Model hyperparameters, parsed from a llama2.c checkpoint header.
+//! Model hyperparameters, parsed from a checkpoint header.
 //!
-//! llama2.c grew three checkpoint formats; [`parse_header`] detects which one a
+//! There are three supported checkpoint formats; [`parse_header`] detects which one a
 //! file uses and parses all of them:
 //!
 //! * **Legacy ("version 0")** — what the TinyStories checkpoints use. Seven
@@ -20,7 +20,7 @@
 //!   positive), a `u8` shared-classifier flag, and — v2 only — the `i32`
 //!   quantization group size; the rest is zero padding. v1 stores fp32 weights
 //!   (in a different order from legacy, see [`crate::weights`]); v2 stores the
-//!   matmul weights pre-quantized to int8 (`runq.c`'s Q8_0 format).
+//!   matmul weights pre-quantized to int8 (group-wise symmetric Q8_0 format).
 //!
 //! The detected variant is reported as a [`ModelFormat`], which the loader uses to
 //! pick the weight layout and validate the file size.
@@ -38,7 +38,7 @@ pub const VERSIONED_HEADER_BYTES: usize = 256;
 /// Legacy files start directly with `dim`, which is never remotely this large.
 pub const MAGIC: u32 = 0x616b_3432;
 
-/// Whether `bytes` look like a llama2.c checkpoint of any supported format — the
+/// Whether `bytes` look like a Llama checkpoint of any supported format — the
 /// counterpart of `seq2seq::config::is_seq2seq` for routing a file to this
 /// architecture.
 ///
@@ -75,7 +75,7 @@ pub enum ModelFormat {
     /// no `freq_cis` tables.
     V1,
     /// Version 2: 256-byte header, RMSNorm gains in fp32 followed by every matmul
-    /// weight pre-quantized to group-wise int8 (`runq.c`'s Q8_0).
+    /// weight pre-quantized to group-wise int8 (Q8_0).
     V2 {
         /// Quantization group size from the header (one `f32` scale per group).
         group_size: usize,

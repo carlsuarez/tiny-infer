@@ -1,6 +1,6 @@
 //! Zero-copy views into a checkpoint's `f32` weight region.
 //!
-//! After the [`Config`] header, an fp32 llama2.c checkpoint stores every weight
+//! After the [`Config`] header, an fp32 checkpoint stores every weight
 //! tensor as raw little-endian `f32`, back to back, in a fixed order. We never
 //! copy or reshape them: [`Weights`] holds borrowed sub-slices that point straight
 //! into the (host-owned, memory-mapped or read) file buffer.

@@ -1,11 +1,11 @@
 //! Checkpoint format conversion: write a loaded fp32 model back out as v1 or v2.
 //!
 //! `--convert <PATH> --to <v1|v2>` reads any fp32 checkpoint (legacy or v1) and
-//! serializes it in the requested llama2.c format:
+//! serializes it in the requested format:
 //!
 //! * **v1** — fp32 with the 256-byte versioned header and the v1 tensor order
 //!   (norms first, no `freq_cis` tables). Lossless; bit-identical weights.
-//! * **v2** — `runq.c`'s Q8_0: the RMSNorm gains in fp32, every matmul weight
+//! * **v2** — Q8_0: the RMSNorm gains in fp32, every matmul weight
 //!   group-wise int8-quantized, each tensor's data followed by its scales. Uses
 //!   the engine's own [`quantize`] kernel, so loading the file back reproduces
 //!   `--quantize` **bit-for-bit** — and a pre-quantized file skips both the
@@ -30,7 +30,7 @@ use crate::llama::loader::Model;
 pub enum Target {
     /// Version 1: fp32, 256-byte header, norms-first tensor order.
     V1,
-    /// Version 2: group-wise int8 (Q8_0), the format `runq.c` reads.
+    /// Version 2: group-wise int8 (Q8_0), the quantized checkpoint format.
     V2,
 }
 
@@ -135,7 +135,7 @@ fn write_v1(out: &mut impl Write, w: &Weights, c: &Config) -> io::Result<()> {
 
 /// Serialize the model as a v2 checkpoint: header, fp32 norms, then each matmul
 /// tensor quantized to int8 — data immediately followed by its scales, one tensor
-/// per layer, in `runq.c`'s order (the order [`llama::quantize::v2_tensor_sizes`]
+/// per layer, in the v2 tensor order (the order [`llama::quantize::v2_tensor_sizes`]
 /// describes).
 fn write_v2(out: &mut impl Write, w: &Weights, c: &Config, group_size: usize) -> io::Result<()> {
     out.write_all(&header(c, 2, Some(group_size as i32)))?;

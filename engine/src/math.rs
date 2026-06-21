@@ -23,7 +23,7 @@
 //! exact integer dot product as the scalar kernel, just far faster, and the std host
 //! only selects them after detecting the CPU feature at runtime.
 //!
-//! The remaining kernels follow Karpathy's llama2.c `run.c` operation-for-operation;
+//! The remaining kernels follow the standard Llama-2 forward pass operation-for-operation;
 //! the details that matter for token-for-token parity at temperature 0 are called
 //! out per function below.
 //!
@@ -153,7 +153,7 @@ pub fn matmul_simd(out: &mut [f32], x: &[f32], w: &[f32], d_in: usize, d_out: us
 /// into `xq` (integer-valued `f32`, range `−127..=127`) with one scale per group in
 /// `x_scales`. Within each group the dot product is accumulated in **`i32`** (exact —
 /// no float rounding), then the integer sum is scaled by `w_scale · x_scale` and folded
-/// into the `f32` output. This is the scheme in llama2.c's `runq.c`: quantizing the
+/// into the `f32` output. This is the standard group-wise int8 scheme: quantizing the
 /// activation too is what turns the inner loop into integer arithmetic, which is where
 /// int8's *compute* advantage lives (weight-only int8 only saves memory). The matmul
 /// output stays `f32` — it feeds rmsnorm/residual/attention, all `f32` — and the next
@@ -501,8 +501,8 @@ fn dispatch_q8_dotprod(
 /// Root-mean-square layer norm: `out = x / √(mean(x²) + ε) ⊙ w`.
 ///
 /// The mean of the squares is taken over the **full length** of `x`, and the gain
-/// vector `w` is applied element-wise. `ε = 1e-5`, matching llama2.c — both the ε
-/// value and "mean, not sum" are classic sources of parity drift, so they are
+/// vector `w` is applied element-wise. `ε = 1e-5`, the standard Llama-2 value — both
+/// the ε value and "mean, not sum" are classic sources of parity drift, so they are
 /// fixed here.
 ///
 /// # Panics
@@ -677,7 +677,7 @@ pub fn gelu(z: f32) -> f32 {
 /// Each `(v[i], v[i+1])` pair is rotated by that angle.
 ///
 /// The query is rotated across the full `dim`; the key is rotated **only while
-/// `i < kv_dim`**. This mirrors llama2.c's `rotn = i < kv_dim ? 2 : 1`, which
+/// `i < kv_dim`** (equivalently `rotn = i < kv_dim ? 2 : 1`), which
 /// matters when `n_kv_heads < n_heads` (grouped-query attention) and is a common
 /// parity pitfall.
 ///
@@ -787,8 +787,8 @@ pub fn add_bias(out: &mut [f32], bias: &[f32]) {
 /// Index of the maximum element, taking the **first** on ties.
 ///
 /// This is greedy (temperature-0) decoding: pick the most probable next token.
-/// The first-on-ties rule (strict `>`) matches llama2.c's `argmax`, which keeps
-/// the earliest index — important for token-for-token parity.
+/// The first-on-ties rule (strict `>`) keeps the earliest index on ties —
+/// important for token-for-token parity with the reference decoder.
 ///
 /// # Panics
 /// In debug builds, if `buf` is empty.

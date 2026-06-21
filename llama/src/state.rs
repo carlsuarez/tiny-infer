@@ -1,6 +1,6 @@
 //! Per-step run state: every working buffer, carved from the [`Arena`] once.
 //!
-//! [`RunState`] mirrors llama2.c's `RunState`: a handful of activation scratch
+//! [`RunState`] is the usual decoder `RunState`: a handful of activation scratch
 //! buffers plus the key/value cache. All of it is allocated from a single
 //! caller-provided [`Arena`] during [`RunState::new`] and then reused in place for
 //! every token, so the steady-state forward pass allocates nothing.

@@ -1,12 +1,11 @@
 //! Seq2seq model hyperparameters, parsed from a tiny-infer seq2seq checkpoint
 //! header.
 //!
-//! The format is tiny-infer's own (there is no Marian-world equivalent of
-//! llama2.c's `.bin`); `scripts/export_marian.py` writes it from a Hugging Face
-//! `MarianMTModel`. It deliberately mirrors the llama2.c **versioned** header
-//! style — a magic, a version, fixed little-endian `i32` fields, flag bytes, zero
-//! padding to a fixed size — but with its own magic so the two families can never
-//! be confused:
+//! The format is tiny-infer's own; `scripts/export_marian.py` writes it from a
+//! Hugging Face `MarianMTModel`. It deliberately mirrors the Llama **versioned**
+//! header style — a magic, a version, fixed little-endian `i32` fields, flag bytes,
+//! zero padding to a fixed size — but with its own magic so the two families can
+//! never be confused:
 //!
 //! | offset | size | field |
 //! |--------|------|-------|
@@ -41,7 +40,7 @@ pub const SEQ2SEQ_HEADER_BYTES: usize = 256;
 
 /// The `u32` magic that opens a seq2seq checkpoint: the ASCII bytes `"tis2"`
 /// (**t**iny-**i**nfer **s**eq**2**seq), read little-endian. Distinct from the
-/// llama2.c family's `"ak42"` magic, so [`is_seq2seq`] can route a file to the
+/// Llama family's `"ak42"` magic, so [`is_seq2seq`] can route a file to the
 /// right loader from its first four bytes.
 pub const SEQ2SEQ_MAGIC: u32 = u32::from_le_bytes(*b"tis2");
 
@@ -290,7 +289,7 @@ mod tests {
 
     #[test]
     fn rejects_wrong_magic() {
-        // A llama2.c versioned header must not parse as seq2seq.
+        // A Llama versioned header must not parse as seq2seq.
         let mut bytes = header(OPUS_EN_FR, OPUS_FLAGS);
         bytes[0..4].copy_from_slice(&llama::config::MAGIC.to_le_bytes());
         assert_eq!(Config::parse(&bytes).unwrap_err(), EngineError::NotSeq2Seq);

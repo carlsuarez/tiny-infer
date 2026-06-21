@@ -2,7 +2,7 @@
 //!
 //! [`forward`] runs a single decoder step for one position, reading and writing the
 //! buffers in [`RunState`] and appending this position's key/value vectors to the
-//! cache. It follows Karpathy's llama2.c `forward()` operation-for-operation so the
+//! cache. It follows the reference Llama-2 `forward()` operation-for-operation so the
 //! greedy (temperature-0) token stream matches bit-for-bit.
 //!
 //! Per layer the sequence is:

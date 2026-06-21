@@ -6,9 +6,9 @@ frameworks, no GPU, no training. The engine core is `no_std` and does all of its
 work out of a single pre-allocated memory arena, the constraint that defines the
 project: after init, the forward pass allocates nothing and grows nothing.
 
-Binary file formats mirror [Andrej Karpathy's llama2.c](https://github.com/karpathy/llama2.c),
-so exported checkpoints load unchanged. The correctness goal is token-for-token
-parity with llama2.c at temperature 0.
+Binary file formats follow the widely-used Llama-2 `.bin` checkpoint layout, so
+exported checkpoints load unchanged. The correctness goal is token-for-token parity
+with a reference C implementation at temperature 0.
 
 ## Commands at a glance
 
@@ -38,8 +38,8 @@ metadata, and the pre-computed memory budget for the working arena.
 math kernels, the `RunState` working set carved from the arena, the full forward
 pass (RMSNorm, RoPE, causal grouped-query attention, SwiGLU), and BPE
 encode/decode. The CLI now generates text. Greedy (temperature-0) output is
-**byte-for-byte identical to llama2.c `run.c`** on stories15M — the correctness
-gate (see [Parity](#parity-with-llama2c)).
+**byte-for-byte identical to a reference C implementation** on stories15M — the
+correctness gate (see [Parity](#parity-with-the-reference)).
 
 **Milestone 3 — sampling (in progress).** Generation now supports temperature and
 top-p (nucleus) sampling in addition to greedy decode: `--temperature 0` (the
@@ -49,7 +49,7 @@ tokens whose probabilities sum to `F`. `--seed` makes a sampled run reproducible
 
 **Seq2seq generation (Marian / OPUS-MT) — end to end (done).** A second
 architecture, added *alongside* the decoder-only path without touching it (the
-llama2.c parity gate stays bit-identical): bidirectional encoder, cross-attention,
+Llama parity gate stays bit-identical): bidirectional encoder, cross-attention,
 LayerNorm with bias, sinusoidal positions, a tied lm_head with `final_logits_bias`.
 The encoder-decoder shape handles any sequence-to-sequence task — translation,
 summarization, paraphrasing — depending on the model; the OPUS-MT fixtures used here
@@ -79,7 +79,7 @@ world!"` prints `Bonjour, le monde !`. The pieces:
   search — is the quality path; sampling adds diversity, not accuracy.
 
 The whole architecture is its own crate (`seq2seq`) — it never touches the Llama path, so
-it can't disturb the llama2.c parity gate.
+it can't disturb the Llama parity gate.
 
 **Int8 quantization (`--quantize`).** All the matmul weights — the seven layer
 projections and the token-embedding/classifier table — can be quantized to group-wise
@@ -97,7 +97,7 @@ format once (`--convert`, below) avoids that entirely — no fp32 weights ever l
 
 The int8 matmul is **W8A8** (full int8): each matmul quantizes its activation to int8
 on the fly ([`quantize_activation`]), accumulates the dot product in `i32`, then applies
-both scales — the scheme in llama2.c `runq.c`. On stories15M the greedy output still
+both scales — the standard group-wise int8 scheme. On stories15M the greedy output still
 keeps the golden story opening.
 
 **Matmul kernels — scalar, SIMD, and hardware dot-product.** The matrix–vector products
@@ -138,14 +138,14 @@ construction; throughput is unbenchmarked here, as the dev machine is x86-64 onl
 
 [`quantize_activation`]: engine/src/quant.rs
 
-**Checkpoint formats — legacy, v1, and v2 (`--convert`).** All three llama2.c
-export formats load transparently (the header is auto-detected):
+**Checkpoint formats — legacy, v1, and v2 (`--convert`).** All three checkpoint
+formats load transparently (the header is auto-detected):
 
 | format | header | weights | notes |
 | ---    | ---    | ---     | ---   |
-| legacy (v0) | 28 B, 7 × `i32` | fp32 | what `export.py --version 0` and the tinyllamas checkpoints use; sign of `vocab_size` encodes classifier sharing |
+| legacy (v0) | 28 B, 7 × `i32` | fp32 | what the stock TinyStories checkpoints use; sign of `vocab_size` encodes classifier sharing |
 | v1 | 256 B, magic `ak42` | fp32 | same tensors, norms-first order, no legacy `freq_cis` padding tables |
-| v2 | 256 B, magic `ak42` | **int8** (Q8_0) | `runq.c`'s format: group-wise int8 with fp32 scales, RMSNorm gains fp32 |
+| v2 | 256 B, magic `ak42` | **int8** (Q8_0) | group-wise int8 with fp32 scales, RMSNorm gains fp32 |
 
 A v2 checkpoint always runs on the int8 path (`--quantize` is implied; the flag is
 ignored with a note). The loader de-interleaves the file's per-tensor data/scales
@@ -155,7 +155,7 @@ materialize, so both load time and peak memory beat quantize-at-load. `--convert
 writer uses the engine's own quantizer, so a converted file reproduces
 `--quantize` **bit-for-bit** (pinned in `host/tests/formats.rs`, alongside the
 byte-identical v1 gate). The tokenizer side is equally format-agnostic: any
-llama2.c-exported SentencePiece vocabulary works, including ones trained without
+exported SentencePiece vocabulary works, including ones trained without
 byte-fallback tokens (unknown codepoints then encode as `<unk>` instead of
 indexing out of bounds).
 
@@ -186,7 +186,7 @@ never reference each other.
 | crate / dir | role |
 |-------------|------|
 | `engine/`   | `#![no_std]`, allocation-free **shared core** — arena, error, math/quant kernels, the 1-D CNN ops, and the sampler. No model shapes. Depends only on `core` + `libm`, `rand`, `wide` (all `no_std`). |
-| `llama/`    | `#![no_std]` **Llama-2** model crate (decoder-only, llama2.c-compatible). Depends on `engine`. Holds the baremetal example. |
+| `llama/`    | `#![no_std]` **Llama-2** model crate (decoder-only). Depends on `engine`. Holds the baremetal example. |
 | `seq2seq/`  | `#![no_std]` **Marian / OPUS-MT** encoder-decoder model crate. Depends on `engine`. Holds the encoder/decoder parity gates. |
 | `host/`     | `std` CLI binary `tiny-infer`: file loading, tokenizers, generation, reporting. Depends on `engine` + `llama` + `seq2seq`; `llama/` and `seq2seq/` driver modules mirror the model crates. |
 | `scripts/`  | Python: export a Hugging Face seq2seq model + build its tokenizer, and capture parity references (see [Python scripts](#python-scripts)). |
@@ -432,13 +432,14 @@ Weights + peak RAM (fp32 vs int8, group_size 32):
   peak RAM         61.46 MiB    19.82 MiB   (weights + arena)
 ```
 
-## Parity with llama2.c
+## Parity with the reference
 
-At temperature 0 the token stream must match the reference exactly. To reproduce:
+At temperature 0 the token stream must match a reference C implementation of the
+same model exactly. To reproduce, run the reference binary (built as `run`) and this
+engine on the same checkpoint and prompt:
 
 ```sh
-# reference (in a checkout of github.com/karpathy/llama2.c)
-gcc -O3 -o run run.c -lm
+# reference C implementation, compiled to `run`
 ./run stories15M.bin -z tokenizer.bin -t 0 -n 40 -i "Tom went to the park"
 
 # this engine
@@ -446,7 +447,7 @@ tiny-infer stories15M.bin tokenizer.bin -p "Tom went to the park" -n 40
 ```
 
 Both print identical text. The golden output is also pinned in
-`host/tests/generate.rs`.
+`host/tests/generate.rs`, so the parity gate runs with no external reference present.
 
 ## Tests & checks
 

@@ -1,16 +1,16 @@
-//! Decoder-only **Llama-2** architecture: the llama2.c-compatible path.
+//! Decoder-only **Llama-2** architecture.
 //!
 //! A standalone `no_std`, allocation-free crate that builds the decoder-only
 //! transformer (TinyStories / Llama-2-style checkpoints) on top of the shared
 //! [`engine`] core — its bump [`Arena`](engine::Arena), the [`math`](engine::math)
 //! kernels, and the int8 [`quant`](engine::quant) primitives. Greedy output stays
-//! bit-for-bit identical to Karpathy's llama2.c. The public API — [`Config`],
+//! bit-for-bit identical to the reference decoder. The public API — [`Config`],
 //! [`Weights`], [`forward`], and friends — is re-exported here at the crate root.
 //!
 //! A Llama-2 layer is RMSNorm (gain only, no bias) → causal GQA self-attention
 //! with RoPE position encoding → SwiGLU feed-forward, all pre-norm, with the token
-//! embedding table tied to the output classifier. Checkpoints use the llama2.c
-//! binary formats (legacy v1 and the quantized `runq.c` v2), parsed by [`config`]
+//! embedding table tied to the output classifier. Checkpoints use the documented
+//! binary formats (legacy, v1, and the quantized int8 v2), parsed by [`config`]
 //! and [`weights`].
 //!
 //! Everything here builds on the shared core — the bump [`Arena`](engine::Arena),

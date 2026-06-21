@@ -1,13 +1,13 @@
-//! Tokenizer vocabulary loading and BPE encode/decode (llama2.c `tokenizer.bin`).
+//! Tokenizer vocabulary loading and BPE encode/decode (the `tokenizer.bin` format).
 //!
 //! Layout: a leading `i32 max_token_length`, then `vocab_size` entries, each
 //! `f32 score`, `i32 len`, `len` raw bytes. `vocab_size` is *not* stored in the
 //! file — it comes from the model config — so the loader is told how many entries
 //! to expect and verifies the file ends exactly there.
 //!
-//! [`Vocab::encode`] and [`Vocab::decode`] implement the same SentencePiece-style
-//! BPE as run.c, so prompts tokenize identically and generation can be checked for
-//! parity. This works for any tokenizer exported by llama2.c's `tokenizer.py` —
+//! [`Vocab::encode`] and [`Vocab::decode`] implement SentencePiece-style
+//! BPE matching the reference tokenizer, so prompts tokenize identically and
+//! generation can be checked for parity. This works for any exported tokenizer —
 //! the stock 32 000-token Llama vocabulary and custom-trained ones alike: the
 //! export replaces the SentencePiece space marker `▁` with an ASCII space
 //! (`0x20`), id `1` (`<s>`) is BOS, and — when the tokenizer was trained with
@@ -147,7 +147,7 @@ impl Vocab {
 
     /// Encode `text` into token ids using SentencePiece-style greedy BPE.
     ///
-    /// Reproduces run.c's `encode()`:
+    /// Reproduces the reference `encode()`:
     /// 1. optionally emit BOS (`<s>`);
     /// 2. emit a "dummy prefix" space token before non-empty text;
     /// 3. map each UTF-8 codepoint to its token, or fall back to raw byte tokens
@@ -167,7 +167,7 @@ impl Vocab {
             }
         }
 
-        // First pass: one token per codepoint, with raw-byte fallback. run.c
+        // First pass: one token per codepoint, with raw-byte fallback. The reference
         // assumes ids 3..=258 are the byte tokens; verify before indexing so a
         // vocabulary trained without byte fallback degrades to <unk> instead of
         // panicking out of bounds.
@@ -216,7 +216,7 @@ impl Vocab {
 
     /// Decode `token` (whose predecessor was `prev_token`) to its raw output bytes.
     ///
-    /// Mirrors run.c's `decode()`: drop a single leading space immediately after
+    /// Mirrors the reference `decode()`: drop a single leading space immediately after
     /// BOS, and expand `<0xNN>` byte-fallback tokens to the raw byte they denote.
     pub fn decode(&self, prev_token: usize, token: usize) -> Vec<u8> {
         let entry = &self.tokens[token];

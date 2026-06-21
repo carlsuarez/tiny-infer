@@ -16,6 +16,6 @@ engine = { path = "../engine" }
 libm = "0.2.16"
 
 [dev-dependencies]
-# Only for the `rejects_wrong_magic` unit test, which checks a llama2.c header does
+# Only for the `rejects_wrong_magic` unit test, which checks a Llama header does
 # not parse as seq2seq — the two crates share no code in the actual build.
 llama = { path = "../llama" }

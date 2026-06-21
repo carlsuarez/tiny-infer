@@ -25,7 +25,7 @@
 //!
 //! The model **architectures live in their own crates** that depend on this one — each
 //! owning its config, weight layout, arena budget, working state, and forward pass:
-//! `llama` (decoder-only Llama-2 / llama2.c) and `seq2seq` (encoder-decoder Marian /
+//! `llama` (decoder-only Llama-2) and `seq2seq` (encoder-decoder Marian /
 //! OPUS-MT). They build entirely on the core above and never reference each other, which
 //! keeps the core small and genuinely reusable by any model crate.
 //!

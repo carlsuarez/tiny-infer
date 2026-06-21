@@ -1,4 +1,4 @@
-//! Checkpoint loading: read a llama2.c `.bin` file (legacy, v1, or v2) and expose
+//! Checkpoint loading: read a Llama-2 `.bin` file (legacy, v1, or v2) and expose
 //! its config plus the right weight view for its format.
 //!
 //! ## Formats
@@ -37,7 +37,7 @@ use llama::{parse_header, Config, ModelFormat, Weights};
 
 use crate::error::HostError;
 
-/// Whether the file at `path` looks like a llama2.c checkpoint (legacy, v1, or v2) —
+/// Whether the file at `path` looks like a Llama-2 checkpoint (legacy, v1, or v2) —
 /// the sibling of [`is_seq2seq_file`](crate::seq2seq::is_seq2seq_file).
 ///
 /// Reads only the leading header bytes and defers to [`is_llama`]. Unlike the seq2seq

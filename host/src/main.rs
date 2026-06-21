@@ -1,7 +1,7 @@
 //! `tiny-infer` command-line host.
 //!
 //! A thin front end over two architecture modules that mirror the engine's split:
-//! * [`llama`] — decoder-only llama2.c checkpoints: report, generate (`--prompt`),
+//! * [`llama`] — decoder-only Llama-2 checkpoints: report, generate (`--prompt`),
 //!   or convert between formats.
 //! * [`seq2seq`] — Marian / OPUS-MT encoder-decoder checkpoints: report, or generate an
 //!   output sequence from the prompt (`--prompt`).
@@ -23,7 +23,7 @@ const USAGE: &str = "\
 tiny-infer — embedded-style transformer inference engine
 
 The architecture is detected from the checkpoint's magic — no flag selects it:
-  * Llama   — decoder-only llama2.c checkpoints (legacy / v1 / v2).
+  * Llama   — decoder-only Llama-2 checkpoints (legacy / v1 / v2).
   * Seq2seq — Marian / OPUS-MT encoder-decoder models (scripts/export_marian.py).
 With --prompt + a tokenizer, Llama continues the text and seq2seq runs the
 encoder-decoder to generate an output sequence for the input (translation,
@@ -35,7 +35,7 @@ USAGE:
     tiny-infer [OPTIONS] <MODEL> [TOKENIZER]
 
 ARGS:
-    <MODEL>        Checkpoint (.bin): a llama2.c model or a tiny-infer seq2seq model
+    <MODEL>        Checkpoint (.bin): a Llama-2 model or a tiny-infer seq2seq model
     [TOKENIZER]    Tokenizer (Llama: required to generate; seq2seq: optional,
                    defaults to tokenizer.bin next to the model)
 
@@ -73,8 +73,8 @@ OPTIONS:
         --convert <PATH>      Convert the checkpoint to PATH and exit (no generation;
                               seq2seq has no on-disk int8 format yet, so this is an
                               error for seq2seq checkpoints)
-        --to <v1|v2>          Conversion target (default v2 = int8 Q8_0 / runq.c's
-                              format, uses --group-size; v1 = fp32, versioned header)\
+        --to <v1|v2>          Conversion target (default v2 = int8 Q8_0 format,
+                              uses --group-size; v1 = fp32, versioned header)\
 ";
 
 fn main() -> ExitCode {
@@ -124,7 +124,7 @@ fn run() -> Result<(), HostError> {
     } else {
         Err(HostError::Format {
             path: model_path.into(),
-            msg: "unrecognized checkpoint format (expected a llama2.c .bin or a \
+            msg: "unrecognized checkpoint format (expected a Llama-2 .bin or a \
                   tiny-infer seq2seq \"tis2\" checkpoint)"
                 .into(),
         })

@@ -5,8 +5,8 @@
 //! architecture-agnostic (it touches only the logits), so the [`Sampler`] lives in the
 //! shared core and serves both the Llama generation loop and the seq2seq decode loop.
 //!
-//! Three modes, decided by `temperature` and `topp` (matching llama2.c's `Sampler`):
-//! * `temperature == 0` → deterministic **greedy** ([`argmax`]); the path the llama2.c
+//! Three modes, decided by `temperature` and `topp`:
+//! * `temperature == 0` → deterministic **greedy** ([`argmax`]); the path the Llama
 //!   parity gate and the Marian greedy-decode gate exercise.
 //! * `temperature > 0`, `topp` disabled (`<= 0` or `>= 1`) → draw from the full
 //!   `softmax(logits / temperature)` distribution.

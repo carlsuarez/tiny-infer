@@ -1,6 +1,6 @@
 [package]
 name = "llama"
-description = "no_std decoder-only Llama-2 (llama2.c-compatible) inference, built on the tiny-infer engine"
+description = "no_std decoder-only Llama-2 inference, built on the tiny-infer engine"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
