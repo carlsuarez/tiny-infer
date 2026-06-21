@@ -9,8 +9,8 @@
 //! `QuantizedWeights` bundle) builds on
 //! these in `llama::quantize`; the seq2seq path will reuse them too.
 //!
-//! The scheme is *group-wise* and *symmetric*, matching llama2.c's `runq.c`
-//! (`GS` = group size): every run of `group_size` consecutive values shares one
+//! The scheme is *group-wise* and *symmetric* (`GS` = group size): every run of
+//! `group_size` consecutive values shares one
 //! `f32` scale, so quantization adapts to the local magnitude of each group rather
 //! than using a single scale for a whole row. Value `k` dequantizes to
 //! `data[k] as f32 * scales[k / group_size]`.
@@ -60,7 +60,7 @@ impl<'a> QuantizedTensor<'a> {
 
 /// Quantize `x` into `data` (8-bit values) + `scales` (one `f32` per group).
 ///
-/// Symmetric per-group quantization, matching llama2.c `runq.c`: for each group of
+/// Symmetric per-group quantization: for each group of
 /// `group_size` consecutive values, the scale is `max(|x|) / 127`, which maps the
 /// group's largest magnitude to ±127; every value is then divided by that scale and
 /// rounded to the nearest integer. Dequantizing (`q * scale`) recovers each value to
@@ -218,6 +218,48 @@ impl<'buf> QuantScratch<'buf> {
     }
 }
 
+/// Saturating rounding doubling high-multiply.
+///
+/// Computes `round(a * b / 2^31)` in `i64` and narrows to `i32`, the building block of the
+/// fixed-point requantization used by integer-only inference. The lone saturating case is
+/// `i32::MIN * i32::MIN`, which would overflow `i32::MAX`.
+fn sat_round_doubling_high_mul(a: i32, b: i32) -> i32 {
+    if a == i32::MIN && b == i32::MIN {
+        return i32::MAX;
+    }
+    let ab = a as i64 * b as i64;
+    // Round to nearest, ties away from zero. Note this is integer *division* (truncating
+    // toward zero), not an arithmetic shift (flooring) — they differ for negative values.
+    let nudge: i64 = if ab >= 0 { 1 << 30 } else { 1 - (1 << 30) };
+    ((ab + nudge) / (1i64 << 31)) as i32
+}
+
+/// Round-to-nearest right shift by `exponent` bits (rounding divide by a power of two).
+fn rounding_divide_by_pot(x: i32, exponent: i32) -> i32 {
+    if exponent == 0 {
+        return x;
+    }
+    let mask = (1i32 << exponent) - 1;
+    let remainder = x & mask;
+    let threshold = (mask >> 1) + i32::from(x < 0);
+    (x >> exponent) + i32::from(remainder > threshold)
+}
+
+/// Multiply an `i32` accumulator by a quantized multiplier `mult * 2^shift` — the
+/// integer-only **requantization** step (multiply by a quantized multiplier).
+///
+/// `mult` is a Q31 fixed-point mantissa in `[2^30, 2^31)` and `shift` is the signed binary
+/// exponent, exactly as produced offline by quantizing a real scale
+/// ratio `M = (s_in · s_w) / s_out` into a mantissa + shift. The result is `round(x · M)`. This is how an integer
+/// matmul/conv rescales its `i32` accumulator into the next layer's int8 domain **without
+/// any floating point** — the one operation that makes "integer-only" inference integer.
+pub fn requantize(x: i32, mult: i32, shift: i32) -> i32 {
+    let left = if shift > 0 { shift } else { 0 };
+    let right = if shift > 0 { 0 } else { -shift };
+    let x = if left > 0 { x.wrapping_shl(left as u32) } else { x };
+    rounding_divide_by_pot(sat_round_doubling_high_mul(x, mult), right)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -298,6 +340,42 @@ mod tests {
         assert_eq!(scales[0], 2.0 / 127.0);
         assert_eq!(data[1], -127);
         assert_eq!(data[3], 127);
+    }
+
+    // Reference `QuantizeMultiplier`: split a real M>0 into a Q31 mantissa in [2^30,2^31)
+    // and a signed shift, matching the offline routine the export tool uses.
+    fn quantize_multiplier(m: f64) -> (i32, i32) {
+        if m == 0.0 {
+            return (0, 0);
+        }
+        let (mut frac, mut shift) = {
+            // frexp: m = frac * 2^exp, frac in [0.5, 1)
+            let exp = m.abs().log2().floor() as i32 + 1;
+            (m / (2f64).powi(exp), exp)
+        };
+        let mut q = (frac * (1i64 << 31) as f64).round() as i64;
+        if q == (1i64 << 31) {
+            q /= 2;
+            shift += 1;
+        }
+        let _ = &mut frac;
+        (q as i32, shift)
+    }
+
+    #[test]
+    fn requantize_approximates_multiply_by_real_scale() {
+        // requantize(x, QuantizeMultiplier(M)) must equal round(x*M) to within one unit.
+        for &m in &[0.0009f64, 0.0123, 0.25, 0.5, 0.7777, 1.5, 3.25] {
+            let (mult, shift) = quantize_multiplier(m);
+            for &x in &[0i32, 1, -1, 7, -7, 1000, -1000, 32768, -32768, 1_000_000] {
+                let got = requantize(x, mult, shift);
+                let want = (x as f64 * m).round() as i32;
+                assert!(
+                    (got - want).abs() <= 1,
+                    "M={m} x={x}: requantize={got} want={want}"
+                );
+            }
+        }
     }
 
     #[test]
