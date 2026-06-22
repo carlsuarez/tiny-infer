@@ -9,8 +9,17 @@ license.workspace = true
 name = "engine"
 path = "src/lib.rs"
 
+[features]
+# Real-FFT magnitude spectrum (`dsp` module). Off by default so the decoder model
+# crates (`llama`, `seq2seq`) pull in no FFT dependency; `edge-pm`'s feature extractor
+# enables it.
+fft = ["dep:microfft"]
+
 [dependencies]
 libm = "0.2.16"
+# Real FFT for the optional `dsp` module (no_std, alloc-free, fixed 512-point). Only the
+# size we use is compiled in; std is off, keeping the engine no_std.
+microfft = { version = "0.6", default-features = false, features = ["size-512"], optional = true }
 # no_std PRNG for the sampler. `default-features = false` drops std / OS entropy so
 # the engine stays no_std; the host supplies the seed.
 rand = { version = "0.10.1", default-features = false }

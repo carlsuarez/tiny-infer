@@ -18,6 +18,8 @@
 //! * [`math`] — the fp32 and int8 compute kernels (matmul, norms, attention, …).
 //! * [`nn`] — the 1-D CNN kernels ([`conv1d`](nn::conv1d), [`relu`](nn::relu),
 //!   [`global_avg_pool`](nn::global_avg_pool)) a feature-window classifier is built from.
+//! * `dsp` — a real-FFT magnitude spectrum (behind the off-by-default `fft` feature), for
+//!   spectral feature extraction; pulled in only by crates that ask for it.
 //! * [`quant`] — the group-wise int8 quantization *primitives* ([`QuantizedTensor`]
 //!   and the quantize/dequantize routines the kernels operate on).
 //! * [`sample`] — the [`Sampler`] that turns a logits row into the next token id
@@ -63,6 +65,8 @@
 // The shared core: building blocks independent of any one architecture. The model
 // architectures live in their own crates (`llama`, `seq2seq`) that depend on this one.
 pub mod arena;
+#[cfg(feature = "fft")]
+pub mod dsp;
 pub mod error;
 pub mod math;
 pub mod nn;
