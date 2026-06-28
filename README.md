@@ -1,14 +1,32 @@
 # tiny-infer
 
-An embedded-style transformer inference engine in Rust. It runs small
-Llama-2-style (TinyStories) language models on the CPU from scratch — no ML
-frameworks, no GPU, no training. The engine core is `no_std` and does all of its
-work out of a single pre-allocated memory arena, the constraint that defines the
-project: after init, the forward pass allocates nothing and grows nothing.
+A small, from-scratch inference **engine** in Rust — `no_std`, allocation-free, no ML
+frameworks, no GPU, no training. The product is the `engine` crate: a library of compute
+kernels (fp32 **and** int8 matmul / attention / norms, 1-D CNN ops, an optional real-FFT)
+plus the machinery they run on — the bump [`Arena`](#the-engine--the-shared-core) every
+working buffer is carved from, the int8 quantization primitives, and a token sampler. The
+constraint that defines the project: all work happens out of a single pre-allocated memory
+arena, so after init the forward pass allocates nothing and grows nothing.
 
-Binary file formats follow the widely-used Llama-2 `.bin` checkpoint layout, so
-exported checkpoints load unchanged. The correctness goal is token-for-token parity
-with a reference C implementation at temperature 0.
+The engine knows **no model shapes**. Each architecture lives in its own crate built on top
+of the engine, and the repo ships two worked examples — both driven by the `tiny-infer`
+CLI — that show how to wire a real model onto the core:
+
+* **`llama`** — decoder-only **Llama-2** / TinyStories (RMSNorm, RoPE, grouped-query
+  attention, SwiGLU). Greedy output is byte-for-byte identical to a reference C
+  implementation at temperature 0.
+* **`seq2seq`** — **Marian / OPUS-MT** encoder-decoder (bidirectional encoder,
+  cross-attention, LayerNorm, sinusoidal positions). Greedy decode matches Hugging Face
+  token-for-token; the OPUS-MT fixtures translate, so `"Hello, world!"` → `Bonjour, le monde !`.
+
+The kernels are reused well beyond transformers: the `edge-pm` project's `pmcore` builds a
+1-D CNN vibration classifier directly on the engine's `nn` and `dsp` modules — same arena,
+same int8 path — on a Cortex-M microcontroller. That is the point of the split: the engine is
+the reusable core, and Llama / seq2seq / edge-pm are just consumers of it.
+
+Binary checkpoint formats follow the widely-used Llama-2 `.bin` layout, so exported
+checkpoints load unchanged. The correctness goal, across every example, is token-for-token
+parity with a reference implementation at temperature 0.
 
 ## Commands at a glance
 
@@ -30,6 +48,11 @@ binary `target/release/tiny-infer`). Full details in [Commands](#commands).
 
 ## Status
 
+The engine grew up alongside its first example (the `llama` path) — Milestones 1–3 below
+track that bring-up — and the later sections are cross-cutting engine capabilities (int8
+quantization, the matmul kernels, the checkpoint formats) shared by every consumer. The
+`seq2seq` example was then added as a second, independent architecture on the same core.
+
 **Milestone 1 — parse & report (done).** Loads a checkpoint and tokenizer,
 validates them, and prints the model config, file-size validation, tokenizer
 metadata, and the pre-computed memory budget for the working arena.
@@ -41,7 +64,7 @@ encode/decode. The CLI now generates text. Greedy (temperature-0) output is
 **byte-for-byte identical to a reference C implementation** on stories15M — the
 correctness gate (see [Parity](#parity-with-the-reference)).
 
-**Milestone 3 — sampling (in progress).** Generation now supports temperature and
+**Milestone 3 — sampling (done).** Generation supports temperature and
 top-p (nucleus) sampling in addition to greedy decode: `--temperature 0` (the
 default) stays deterministic/greedy, a higher temperature draws each token from the
 softmax distribution, and `--topp <F>` restricts that draw to the most-probable
@@ -179,15 +202,15 @@ runs a full forward pass out of stack buffers with no allocator — see
 ## Repository map
 
 Four crates in a Cargo workspace, plus Python helpers and git-ignored model fixtures.
-**`engine` is the reusable core; each model architecture is its own crate that depends on
-it** (the way a downstream project like edge-pm's `pmcore` would). The two architectures
-never reference each other.
+**`engine` is the reusable core; each model architecture ships as its own example crate
+built on it** — the same way an external project (edge-pm's `pmcore`) consumes the engine
+from outside this workspace. The two architecture crates never reference each other.
 
 | crate / dir | role |
 |-------------|------|
-| `engine/`   | `#![no_std]`, allocation-free **shared core** — arena, error, math/quant kernels, the 1-D CNN ops, and the sampler. No model shapes. Depends only on `core` + `libm`, `rand`, `wide` (all `no_std`). |
-| `llama/`    | `#![no_std]` **Llama-2** model crate (decoder-only). Depends on `engine`. Holds the baremetal example. |
-| `seq2seq/`  | `#![no_std]` **Marian / OPUS-MT** encoder-decoder model crate. Depends on `engine`. Holds the encoder/decoder parity gates. |
+| `engine/`   | `#![no_std]`, allocation-free **shared core** — arena, error, math/quant kernels, the 1-D CNN ops, the optional FFT (`fft` feature), and the sampler. No model shapes. Depends only on `core` + `libm`, `rand`, `wide` (all `no_std`), plus `microfft` when `fft` is enabled. |
+| `llama/`    | `#![no_std]` **Llama-2** example model crate (decoder-only). Depends on `engine`. Holds the baremetal example. |
+| `seq2seq/`  | `#![no_std]` **Marian / OPUS-MT** example model crate (encoder-decoder). Depends on `engine`. Holds the encoder/decoder parity gates. |
 | `host/`     | `std` CLI binary `tiny-infer`: file loading, tokenizers, generation, reporting. Depends on `engine` + `llama` + `seq2seq`; `llama/` and `seq2seq/` driver modules mirror the model crates. |
 | `scripts/`  | Python: export a Hugging Face seq2seq model + build its tokenizer, and capture parity references (see [Python scripts](#python-scripts)). |
 | `models/`   | downloaded / exported checkpoints + parity fixtures (**git-ignored**; recreate via curl + the scripts). |
@@ -203,10 +226,19 @@ engine/src/
   arena.rs         # the bump Arena every working buffer is carved from
   error.rs         # the crate-wide EngineError
   math.rs          # fp32 + int8 compute kernels (matmul, W8A8, norms, attention, RoPE, …)
-  nn.rs            # 1-D CNN kernels (conv1d, relu, global_avg_pool) for feature-window classifiers
+  nn.rs            # 1-D CNN kernels (conv1d, relu, global_avg_pool) — fp32 + int8 — for feature-window classifiers
+  dsp.rs           # real-FFT magnitude spectrum (512-pt, behind the `fft` feature) for spectral feature extraction
   quant.rs         # group-wise int8 quantization primitives (QuantizedTensor, QuantScratch, quantize/dequantize)
   sample.rs        # the Sampler (greedy / temperature / top-p) over rand's no_std Xoshiro128++ PRNG
 ```
+
+The `nn` and `dsp` modules don't serve the transformer path at all — they exist so a
+downstream classifier (edge-pm's `pmcore`) can build a 1-D CNN over windowed sensor
+features on the same arena + kernels. `dsp` (real FFT via [`microfft`]) sits behind the
+**off-by-default `fft` feature**, so the `llama` / `seq2seq` crates pull in no FFT
+dependency; only a crate that asks for it (`edge-pm`) does.
+
+[`microfft`]: https://crates.io/crates/microfft
 
 ### The model crates — `llama` and `seq2seq`
 
@@ -282,8 +314,8 @@ pip install -r scripts/requirements.txt      # torch, transformers, sentencepiec
 |--------|--------------|-------------------------------|-------|---------|
 | **export_marian.py** | Converts a Hugging Face `MarianMTModel` (OPUS-MT) to tiny-infer's `tis2` seq2seq format, and saves the SentencePiece artifacts; calls `dump_tokenizer.py` for you. | `model.bin`, `source.spm`/`target.spm`/`vocab.json`, `tokenizer.bin` | torch, transformers, sentencepiece | the seq2seq CLI; `tests/seq2seq.rs` |
 | **dump_tokenizer.py** | Builds the host's `tokenizer.bin` (Unigram piece/score table + id→piece map) from `source.spm` + `vocab.json`. Usually run automatically by `export_marian.py`; run it standalone to rebuild just the tokenizer. | `tokenizer.bin` | sentencepiece (no torch) | the seq2seq tokenizer |
-| **dump_encoder_ref.py** | Runs HF's Marian **encoder** on a fixed input and dumps its `last_hidden_state`. | `encoder_ref.bin` | torch, transformers | `engine/tests/encode_parity.rs` |
-| **dump_decode_ref.py** | Runs HF **greedy generation** (`num_beams=1, do_sample=False`) on a fixed sentence and dumps the source + generated token ids. | `decode_ref.bin` | torch, transformers | `engine/tests/decode_parity.rs` |
+| **dump_encoder_ref.py** | Runs HF's Marian **encoder** on a fixed input and dumps its `last_hidden_state`. | `encoder_ref.bin` | torch, transformers | `seq2seq/tests/encode_parity.rs` |
+| **dump_decode_ref.py** | Runs HF **greedy generation** (`num_beams=1, do_sample=False`) on a fixed sentence and dumps the source + generated token ids. | `decode_ref.bin` | torch, transformers | `seq2seq/tests/decode_parity.rs` |
 
 Typical flow — export a translation model, then (optionally) generate the parity
 fixtures so the engine's seq2seq gates run instead of skipping:
